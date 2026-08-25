@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - service-account.yaml
+  - deployment.yaml
+  - service.yaml
+  - security-controls.yaml
+  - network-policies.yaml
+images:
+  - name: vulnerable-flask
+    newName: REPLACE_WITH_ECR_REPOSITORY
+    newTag: latest
