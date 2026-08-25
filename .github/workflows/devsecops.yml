@@ -1,8 +1,11 @@
 name: DevSecOps CI
+
 on:
   pull_request:
   push:
-    branches: [main]
+    branches:
+      - main
+      - feature/fix-issues
 permissions:
   contents: read
   security-events: write
