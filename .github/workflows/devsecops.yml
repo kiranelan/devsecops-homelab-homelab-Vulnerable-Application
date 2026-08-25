@@ -1,0 +1,59 @@
+name: DevSecOps CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  security-events: write
+jobs:
+  validate-and-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+      - uses: azure/setup-kubectl@v4
+      - name: Python syntax
+        run: python -m py_compile app/app.py
+      - name: Terraform formatting and validation
+        run: |
+          terraform -chdir=terraform fmt -check -recursive
+          terraform -chdir=terraform init -backend=false
+          terraform -chdir=terraform validate
+      - name: Render Kubernetes manifests
+        run: kubectl kustomize kubernetes/base > rendered.yaml
+      - name: Build application image
+        run: docker build -t vulnerable-app:${{ github.sha }} app
+      - name: Bandit SAST report
+        continue-on-error: true
+        run: |
+          pip install bandit
+          bandit -r app -f json -o bandit.json
+      - name: Trivy repository scan
+        uses: aquasecurity/trivy-action@0.32.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy.sarif
+          severity: HIGH,CRITICAL
+          exit-code: 0
+      - name: Checkov IaC scan
+        continue-on-error: true
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          output_format: cli,json
+          output_file_path: console,checkov.json
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            bandit.json
+            checkov.json
+            trivy.sarif
+            rendered.yaml

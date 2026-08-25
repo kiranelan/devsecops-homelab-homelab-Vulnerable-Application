@@ -1,0 +1,12 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform/backend.tf
+terraform/terraform.tfvars
+reports/
+rendered.yaml
+*.pem
+*.key
+.env
+__pycache__/
+*.pyc
