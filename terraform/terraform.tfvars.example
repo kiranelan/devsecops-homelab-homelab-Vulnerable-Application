@@ -1,24 +1,24 @@
-# Terraform Variables Example
-# Copy this file to terraform.tfvars and customize for your needs
+aws_region   = "us-west-2"
+cluster_name = "eks-interview-lab"
 
-# Basic configuration
-aws_region     = "us-west-2"
-cluster_name   = "eks-interview-lab"
+# Replace this with a Kubernetes version currently in EKS standard support.
 cluster_version = "1.32"
 
-# Node configuration
-node_instance_type     = "t3.small"  # Options: t3.small, t3.medium, t3.large
-node_desired_capacity  = 1           # Number of nodes
-node_max_capacity      = 3           # Maximum nodes for scaling
-use_spot_instances     = false       # Use Spot instances (can be interrupted)
+# Minimal practical capacity for this EKS/PostgreSQL demonstration.
+node_instance_type    = "t3.small"
+node_desired_capacity = 1
+node_max_capacity     = 1
+use_spot_instances    = true
 
-# Configuration examples:
-# For minimal resources:
-# node_instance_type = "t3.small"
-# node_desired_capacity = 1
-# use_spot_instances = true
+# Recommended: one NAT Gateway with private worker nodes.
+enable_nat_gateway = false
 
-# For better performance:
-# node_instance_type = "t3.medium"
-# node_desired_capacity = 2
-# use_spot_instances = false
+# Lowest-cost alternative: set false to remove NAT and place the worker node
+# in public subnets. Use only for a short-lived isolated lab.
+# enable_nat_gateway = false
+
+# Keep WAF disabled until the ALB/WAF portion of the demonstration.
+enable_edge_security = false
+
+waf_log_retention_days = 1
+ecr_max_image_count    = 3

@@ -1,5 +1,6 @@
 terraform {
-  required_version = ">= 1.5.7"
+  required_version = ">= 1.5.7, < 2.0.0"
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -8,8 +9,14 @@ terraform {
   }
 }
 
-# Pin the EKS module to a modern minor version (adjust as needed)
-# See terraform-aws-modules/eks/aws for latest (example uses ~>21.0).
 provider "aws" {
   region = var.aws_region
+
+  default_tags {
+    tags = {
+      Purpose   = "devsecops-interview"
+      ManagedBy = "terraform"
+    }
+  }
 }
+
