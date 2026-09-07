@@ -1,49 +1,100 @@
 name: DevSecOps CI
 
 on:
+  workflow_dispatch:
+
   pull_request:
+    branches:
+      - main
+
   push:
     branches:
       - main
       - feature/fix-issues
-permissions:
-  id-token: write
-  contents: read
-  security-events: write
 
+concurrency:
+  group: devsecops-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  validate-and-scan:
+  validate:
+    name: Validate application and infrastructure
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.10.5
-      - uses: azure/setup-kubectl@v4
-      - name: Python syntax
-        run: python -m py_compile app/app.py
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
+          terraform_wrapper: false
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v5
         with:
-          role-to-assume: arn:aws:iam::854481201284:role/DevSecOpsLabTerraformRole
-          aws-region: us-west-2
-          role-session-name: devsecops-terraform
-      - name: Terraform formatting and validation
-        run: |
-          terraform -chdir=terraform fmt -check -recursive
-          terraform -chdir=terraform init -backend=false
-          terraform -chdir=terraform validate
+          version: latest
+
+      - name: Validate Python syntax
+        run: python -m py_compile app/app.py
+
+      - name: Check Terraform formatting
+        run: terraform -chdir=terraform fmt -check -recursive
+
+      - name: Initialize Terraform without backend
+        run: terraform -chdir=terraform init -backend=false
+
+      - name: Validate Terraform
+        run: terraform -chdir=terraform validate
+
       - name: Render Kubernetes manifests
         run: kubectl kustomize kubernetes/base > rendered.yaml
+
       - name: Build application image
-        run: docker build -t vulnerable-app:${{ github.sha }} app
-      - name: Bandit SAST report
+        run: |
+          docker build \
+            --tag "vulnerable-app:${GITHUB_SHA}" \
+            app
+
+      - name: Upload rendered Kubernetes manifests
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rendered-kubernetes-manifests
+          path: rendered.yaml
+          if-no-files-found: warn
+          retention-days: 7
+
+  security-scans:
+    name: Run DevSecOps security scans
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Bandit
+        run: python -m pip install --disable-pip-version-check bandit
+
+      - name: Run Bandit SAST
+        id: bandit
         continue-on-error: true
         run: |
-          pip install bandit
-          bandit -r app -f json -o bandit.json
-      - name: Trivy repository scan
+          bandit \
+            --recursive app \
+            --format json \
+            --output bandit.json
+
+      - name: Run Trivy repository scan
+        id: trivy
+        continue-on-error: true
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
@@ -51,21 +102,63 @@ jobs:
           format: sarif
           output: trivy.sarif
           severity: HIGH,CRITICAL
-          exit-code: 0
-      - name: Checkov IaC scan
+          exit-code: "0"
+          ignore-unfixed: false
+
+      - name: Run Checkov IaC scan
+        id: checkov
         continue-on-error: true
         uses: bridgecrewio/checkov-action@v12
         with:
           directory: .
           output_format: cli,json
           output_file_path: console,checkov.json
+
+      - name: Create scan summary
+        if: always()
+        run: |
+          {
+            echo "## DevSecOps scan summary"
+            echo
+            echo "| Scanner | Step result |"
+            echo "|---|---|"
+            echo "| Bandit | ${{ steps.bandit.outcome }} |"
+            echo "| Trivy | ${{ steps.trivy.outcome }} |"
+            echo "| Checkov | ${{ steps.checkov.outcome }} |"
+            echo
+            echo "The application is intentionally vulnerable, so findings are expected."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload security reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: security-reports
           path: |
             bandit.json
             checkov.json
             trivy.sarif
-            rendered.yaml
+          if-no-files-found: warn
+          retention-days: 7
+
+  aws-authentication:
+    name: Verify AWS OIDC authentication
+    runs-on: ubuntu-latest
+
+    # Do not grant the AWS infrastructure role to pull-request workflows.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::854481201284:role/DevSecOpsLabTerraformRole
+          aws-region: us-west-2
+          role-session-name: devsecops-terraform
+
+      - name: Verify assumed AWS identity
+        run: aws sts get-caller-identity
