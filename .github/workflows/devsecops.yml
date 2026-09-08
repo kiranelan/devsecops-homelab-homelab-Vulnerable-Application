@@ -54,6 +54,15 @@ jobs:
       - name: Render Kubernetes manifests
         run: kubectl kustomize kubernetes/base > rendered.yaml
 
+      - name: Initialize Terraform backend
+        run: |
+          terraform -chdir=terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=devsecops-interview-lab/terraform.tfstate" \
+            -backend-config="region=us-west-2" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
       - name: Build application image
         run: |
           docker build \
