@@ -2,20 +2,18 @@ aws_region   = "us-west-2"
 cluster_name = "eks-interview-lab"
 
 # Replace this with a Kubernetes version currently in EKS standard support.
-cluster_version = "1.32"
+cluster_version = "1.35"
 
-# Minimal practical capacity for this EKS/PostgreSQL demonstration.
+# Minimal practical capacity for this EKS/PostgreSQL demonstration. t3.medium if pods are in pending state
 node_instance_type    = "t3.small"
 node_desired_capacity = 1
 node_max_capacity     = 1
 use_spot_instances    = true
 
-# Recommended: one NAT Gateway with private worker nodes.
+# Lowest-cost lab mode: no NAT Gateway. The managed worker node is placed
+# in public subnets and receives a public IPv4 address for outbound access.
+# Set to true only when private worker nodes and a single NAT Gateway are required.
 enable_nat_gateway = false
-
-# Lowest-cost alternative: set false to remove NAT and place the worker node
-# in public subnets. Use only for a short-lived isolated lab.
-# enable_nat_gateway = false
 
 # Keep WAF disabled until the ALB/WAF portion of the demonstration.
 enable_edge_security = false

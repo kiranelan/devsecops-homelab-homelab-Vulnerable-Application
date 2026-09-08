@@ -12,14 +12,14 @@ variable "cluster_name" {
 
 variable "cluster_version" {
   type        = string
-  default     = "1.32"
-  description = "EKS Kubernetes version; select a version in standard support before applying"
+  default     = "1.35"
+  description = "EKS Kubernetes version in standard support"
 }
 
 variable "node_instance_type" {
   type        = string
   default     = "t3.small"
-  description = "EC2 instance type for the single lab worker node"
+  description = "EC2 instance type for the single lab worker node. t3.medium if pods are in pending state"
 }
 
 variable "node_desired_capacity" {

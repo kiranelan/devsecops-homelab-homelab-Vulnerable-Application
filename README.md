@@ -17,7 +17,7 @@ Terraform      -> VPC + EKS + KMS + ECR + WAF + CloudWatch logs
 
 ## Controls implemented
 
-- Private EKS worker subnets, KMS encryption for Kubernetes secrets, ECR scan-on-push
+- Cost-optimized lab mode uses one EKS worker in public subnets without a NAT Gateway. Private workers with a single NAT Gateway remain available through the enable_nat_gateway variable.
 - AWS-managed Common, Known Bad Inputs, and SQLi WAF rule groups plus IP rate limiting
 - WAF sampled requests, metrics, CloudWatch logging, and authorization-header redaction
 - Restricted Pod Security Standards, non-root containers, dropped Linux capabilities, read-only root filesystem
@@ -130,6 +130,6 @@ CONFIRM_DESTROY=yes ./scripts/cleanup.sh
 
 - WAF is compensating control, not a replacement for fixing application code.
 - A public EKS endpoint is convenient for the lab; production should restrict its CIDRs or use private access.
-- A single NAT gateway reduces lab cost but is not multi-AZ resilient.
+- The default lab configuration removes the NAT Gateway and uses public worker subnets to minimize cost. Production should use private workers, NAT Gateways or VPC endpoints, and stronger network isolation.
 - Secrets are generated at deployment time; production should use AWS Secrets Manager with External Secrets or Secrets Store CSI.
 - The intentionally vulnerable image should never be promoted beyond a dedicated lab environment.
