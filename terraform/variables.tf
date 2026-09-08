@@ -52,8 +52,8 @@ variable "use_spot_instances" {
 
 variable "enable_nat_gateway" {
   type        = bool
-  default     = true
-  description = "Use one NAT Gateway and private worker nodes; false uses public worker subnets for temporary lab use"
+  default     = false
+  description = "Disable NAT and use public worker subnets by default for the temporary low-cost lab; true enables private workers with one NAT Gateway"
 }
 
 variable "enable_edge_security" {
