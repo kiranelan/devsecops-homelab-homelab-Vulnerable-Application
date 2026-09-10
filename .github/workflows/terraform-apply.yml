@@ -93,7 +93,6 @@ jobs:
       - name: Enforce deployment safety checks
         run: |
           PLAN_JSON="terraform/terraform-plan.json"
-          ALLOWED_FAILED_NODE_GROUP='module.eks.module.eks_managed_node_group["default"].aws_eks_node_group.this[0]'
 
           test -s "$PLAN_JSON"
 
@@ -117,32 +116,6 @@ jobs:
             ' "$PLAN_JSON"
           )"
 
-          ALLOWED_REPLACEMENT_COUNT="$(
-            jq \
-              --arg allowed "$ALLOWED_FAILED_NODE_GROUP" '
-                [
-                  .resource_changes[]?
-                  | select(.address == $allowed)
-                  | select(.change.before.status == "CREATE_FAILED")
-                  | select(.change.actions | index("create"))
-                  | select(.change.actions | index("delete"))
-                ]
-                | length
-              ' "$PLAN_JSON"
-          )"
-
-          UNSAFE_DELETE_COUNT="$(
-            jq \
-              --arg allowed "$ALLOWED_FAILED_NODE_GROUP" '
-                [
-                  .resource_changes[]?
-                  | select(.change.actions | index("delete"))
-                  | select(.address != $allowed)
-                ]
-                | length
-              ' "$PLAN_JSON"
-          )"
-
           NAT_GATEWAY_CREATE_COUNT="$(
             jq '
               [
@@ -162,23 +135,11 @@ jobs:
 
           echo "Resources to create: $CREATE_COUNT"
           echo "Resources to delete or replace: $DELETE_COUNT"
-          echo "Allowed failed-node-group replacements: $ALLOWED_REPLACEMENT_COUNT"
-          echo "Unsafe deletions or replacements: $UNSAFE_DELETE_COUNT"
           echo "NAT Gateways to create: $NAT_GATEWAY_CREATE_COUNT"
           echo "Worker subnet mode: $WORKER_SUBNET_MODE"
 
-          if [ "$UNSAFE_DELETE_COUNT" -ne 0 ]; then
-            echo "Deployment blocked: plan contains an unauthorized deletion or replacement."
-            exit 1
-          fi
-
-          if [ "$DELETE_COUNT" -ne "$ALLOWED_REPLACEMENT_COUNT" ]; then
-            echo "Deployment blocked: deletion does not match the approved failed node-group replacement."
-            exit 1
-          fi
-
-          if [ "$ALLOWED_REPLACEMENT_COUNT" -gt 1 ]; then
-            echo "Deployment blocked: more than one failed node-group replacement was detected."
+          if [ "$DELETE_COUNT" -ne 0 ]; then
+            echo "Deployment blocked: plan contains deletion or replacement actions."
             exit 1
           fi
 
@@ -194,6 +155,7 @@ jobs:
 
           if [ "$CREATE_COUNT" -eq 0 ]; then
             echo "Deployment blocked: plan contains no resource creation."
+            echo "Use the Terraform plan workflow to confirm whether infrastructure is already current."
             exit 1
           fi
 
