@@ -1,44 +1,76 @@
-# Infrastructure as Code
+# Terraform comparison update
 
-This directory contains Terraform configuration for the EKS infrastructure.
+These files are intended to be compared with the repository's existing
+`terraform/` directory. Review the differences before copying them into the
+repository.
 
-## Files
+## Recommended default
 
-- **`eks.tf`** - EKS cluster configuration
-- **`vpc.tf`** - VPC with public/private subnets
-- **`variables.tf`** - Terraform variables
-- **`output.tf`** - Terraform outputs
-- **`versions.tf`** - Provider versions
-- **`backend.example.tf`** - Backend configuration example
-- **`aws-waf-example.tf`** - AWS WAF configuration example
+The default configuration retains one NAT Gateway and places the EKS managed
+node group in private subnets. This matches the stronger architecture described
+in the project documentation.
 
-## Usage
+```hcl
+enable_nat_gateway  = true
+enable_edge_security = false
+```
 
-1. Configure backend (optional):
-   ```bash
-   cp backend.example.tf backend.tf
-   # Edit backend.tf with your S3 bucket details
-   ```
+`enable_edge_security` defaults to `false` so that WAF and its CloudWatch log
+group are created only for the short WAF demonstration. Set it to `true` before
+applying the ALB Ingress.
 
-2. Deploy infrastructure:
-   ```bash
-   terraform init
-   terraform plan
-   terraform apply
-   ```
+## Lowest-cost lab mode
 
-3. Configure kubectl:
-   ```bash
-   aws eks update-kubeconfig --region us-west-2 --name eks-interview-lab
-   ```
+To remove the NAT Gateway, set:
 
-4. Cleanup:
-   ```bash
-   terraform destroy
-   ```
+```hcl
+enable_nat_gateway = false
+```
 
-## Prerequisites
+The included VPC and EKS files then:
 
-- AWS CLI configured
-- Terraform >= 1.0
-- Appropriate AWS permissions for EKS, VPC, and IAM
+- Disable the NAT Gateway.
+- Enable public IPv4 assignment on public subnets.
+- Place the single EKS node group in public subnets.
+
+This is suitable only for a temporary lab. The node security groups must remain
+restricted. Do not disable NAT while continuing to place nodes in private
+subnets unless the required VPC endpoints are also configured.
+
+## Files changed
+
+| File | Change |
+|---|---|
+| `versions.tf` | Pins compatible Terraform and AWS provider ranges. |
+| `variables.tf` | Adds NAT, WAF, log-retention and ECR-retention controls. |
+| `vpc.tf` | Makes the single NAT optional and supports public-node lab mode. |
+| `eks.tf` | Selects private or public node subnets according to NAT mode. |
+| `security-examples.tf` | Retains only the KMS resources actually used by EKS and enables rotation. |
+| `ecr.tf` | Allows cleanup of lab images and retains only three images. |
+| `waf.tf` | Fixes invalid nested-block syntax and makes edge security optional. |
+| `output.tf` | Handles an optional WAF without invalid indexing. |
+| `terraform.tfvars.example` | Shows recommended and lowest-cost settings. |
+
+## Apply the comparison
+
+From the repository root:
+
+```bash
+cp terraform/terraform.tfvars.example terraform/terraform.tfvars
+terraform -chdir=terraform fmt -recursive
+terraform -chdir=terraform init -backend=false
+terraform -chdir=terraform validate
+terraform -chdir=terraform plan
+```
+
+Do not apply until the plan shows only the expected lab resources.
+
+## Cost workflow
+
+1. Keep `enable_edge_security = false` for initial EKS and port-forward tests.
+2. Set it to `true` only when preparing the ALB/WAF demonstration.
+3. Delete the Kubernetes Ingress before destroying Terraform resources.
+4. Run `terraform destroy` the same day.
+
+The EKS control plane is billable even when no application pods are running.
+

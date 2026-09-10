@@ -13,7 +13,7 @@ import json
 from urllib.parse import unquote
 
 app = Flask(__name__)
-app.secret_key = 'insecure-secret-key-change-in-production'
+app.secret_key = os.getenv('FLASK_SECRET_KEY', 'insecure-lab-only-secret')
 
 # Database configuration
 DB_CONFIG = {
@@ -21,7 +21,7 @@ DB_CONFIG = {
     'port': os.getenv('DB_PORT', '5432'),
     'database': os.getenv('DB_NAME', 'vulnerable_app'),
     'user': os.getenv('DB_USER', 'appuser'),
-    'password': os.getenv('DB_PASSWORD', 'apppass')
+    'password': os.getenv('DB_PASSWORD', '')
 }
 
 def get_db_connection():
@@ -32,6 +32,20 @@ def get_db_connection():
     except Exception as e:
         print(f"Database connection error: {e}")
         return None
+
+@app.route('/healthz')
+def healthz():
+    """Process health endpoint used by container and Kubernetes probes."""
+    return {"status": "ok"}, 200
+
+@app.route('/readyz')
+def readyz():
+    """Readiness endpoint verifies that PostgreSQL is reachable."""
+    conn = get_db_connection()
+    if not conn:
+        return {"status": "not-ready"}, 503
+    conn.close()
+    return {"status": "ready"}, 200
 
 # HTML Templates
 INDEX_TEMPLATE = """

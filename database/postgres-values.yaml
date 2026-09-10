@@ -6,17 +6,19 @@
 global:
   postgresql:
     auth:
-      postgresPassword: "postgres"
       username: "appuser"
-      password: "apppass"
       database: "vulnerable_app"
+      existingSecret: "postgres-credentials"
+      secretKeys:
+        adminPasswordKey: "postgres-password"
+        userPasswordKey: "password"
 
 # Primary configuration
 primary:
   persistence:
     enabled: true
     size: 10Gi
-    storageClass: "gp2"
+    storageClass: "gp3"
   
   resources:
     requests:
@@ -52,7 +54,7 @@ service:
 
 # Network policies (optional)
 networkPolicy:
-  enabled: false
+  enabled: true
 
 # Monitoring (optional)
 metrics:

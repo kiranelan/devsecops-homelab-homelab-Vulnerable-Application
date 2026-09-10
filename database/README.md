@@ -9,27 +9,35 @@ This directory contains PostgreSQL database configuration and test data.
 
 ## Test Data Included
 
-- **Users** - 10 test users including admin accounts
+- **Users** - 9 test users including admin accounts
 - **Posts** - 11 test posts with security-focused content
-- **Comments** - 20+ test comments including XSS payloads
-- **Additional objects** - Views, stored procedures, and indexes
+- **Comments** - 6 test comments including XSS payloads
+- **Additional objects** - A view and a PostgreSQL SQL function
 
 ## Usage
 
 1. Deploy PostgreSQL using Helm:
    ```bash
-   helm install postgres bitnami/postgresql -f postgres-values.yaml
+   kubectl create namespace database
+   kubectl -n database create secret generic postgres-credentials \
+     --from-literal=postgres-password='<generated-admin-password>' \
+     --from-literal=password='<generated-app-password>'
+   helm upgrade --install postgresql \
+     oci://registry-1.docker.io/bitnamicharts/postgresql \
+     -n database -f postgres-values.yaml
    ```
 
 2. Import test data:
    ```bash
-   kubectl cp init-db.sql <postgres-pod>:/tmp/init-db.sql
-   kubectl exec -it <postgres-pod> -- psql -U postgres -d vulnerable_app -f /tmp/init-db.sql
+   kubectl -n database cp init-db.sql postgresql-0:/tmp/init-db.sql
+   kubectl -n database exec -it postgresql-0 -- \
+     psql -U appuser -d vulnerable_app -f /tmp/init-db.sql
    ```
 
 3. Verify data import:
    ```bash
-   kubectl exec -it <postgres-pod> -- psql -U postgres -d vulnerable_app -c "SELECT COUNT(*) FROM users;"
+   kubectl -n database exec -it postgresql-0 -- \
+     psql -U appuser -d vulnerable_app -c "SELECT COUNT(*) FROM users;"
    ```
 
 ## Security Note

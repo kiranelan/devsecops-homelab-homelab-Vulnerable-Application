@@ -1,198 +1,145 @@
-# DevSecOps Interview Lab
+# DevSecOps EKS Security Lab
 
-This repository contains a hands-on interview test for DevSecOps candidates. You'll start with basic infrastructure and progressively add security components.
+Submission-ready homelab that deploys an intentionally vulnerable Flask application and PostgreSQL database to Amazon EKS, protects the public ALB with AWS WAF, and demonstrates layered DevSecOps controls.
 
-## Interview Overview
+> **Safety:** Deploy only in an isolated training AWS account. The application intentionally contains SQL injection, stored XSS, weak authentication, authorization bypass, plain-text training passwords, and information disclosure. Never expose the application without the documented controls.
 
-You have **2-3 hours** to complete the following tasks. This test evaluates your ability to:
-- Deploy and manage Kubernetes infrastructure
-- Implement security best practices
-- Deploy and configure security tools
-- Troubleshoot and optimize systems
+## Architecture
+
+```text
+Internet -> AWS WAF -> ALB Ingress -> Flask pods -> PostgreSQL StatefulSet/PVC
+                          |                |
+                     NetworkPolicy    Kubernetes Secrets
+
+GitHub Actions -> SAST + dependency/container/IaC scans -> security artifacts
+Terraform      -> VPC + EKS + KMS + ECR + WAF + CloudWatch logs
+```
+
+## Controls implemented
+
+- Cost-optimized lab mode uses one EKS worker in public subnets without a NAT Gateway. Private workers with a single NAT Gateway remain available through the enable_nat_gateway variable.
+- AWS-managed Common, Known Bad Inputs, and SQLi WAF rule groups plus IP rate limiting
+- WAF sampled requests, metrics, CloudWatch logging, and authorization-header redaction
+- Restricted Pod Security Standards, non-root containers, dropped Linux capabilities, read-only root filesystem
+- Least-privilege service account with token automount disabled
+- Namespace isolation, database-only egress, DNS-only supporting egress, resource quotas, PDB, HPA
+- Runtime-created Kubernetes secrets; no real credential values are committed
+- GitHub Actions validation plus Bandit, Trivy, and Checkov reports
+- Safe repeatable build, deploy, test, and guarded cleanup scripts
 
 ## Prerequisites
 
-- AWS CLI configured with appropriate permissions
-- Terraform >= 1.0
-- kubectl
-- Docker
-- Helm (or ability to install it)
-- Knowledge of Kubernetes, security concepts, and infrastructure
-- S3 bucket for Terraform state (or use local state)
+- AWS CLI authenticated to a disposable account
+- Terraform, Docker, kubectl, Helm, OpenSSL, and Git
+- Permissions for VPC, EKS, IAM, EC2, KMS, ECR, WAFv2, and CloudWatch Logs
+- AWS Load Balancer Controller installed in the cluster before applying `kubernetes/ingress.yaml`
 
-## Getting Started
+## 1. Provision infrastructure
 
-1. **Fork this repository** to your own GitHub account
-2. **Clone your fork** locally
-3. **Follow the tasks below** in order
-4. **Document your approach** as you go
-5. **Be prepared to explain** your decisions and trade-offs
+```bash
+cp terraform/terraform.tfvars.example terraform/terraform.tfvars
+terraform -chdir=terraform init
+terraform -chdir=terraform plan -out=tfplan
+terraform -chdir=terraform apply tfplan
+aws eks update-kubeconfig \
+  --region "$(terraform -chdir=terraform output -raw aws_region)" \
+  --name "$(terraform -chdir=terraform output -raw cluster_name)"
+kubectl get nodes
+```
 
-### Setup home lab
+### Terraform remote state
 
-### Infrastructure Setup
-**Objective:** Deploy basic EKS infrastructure
+Terraform uses the existing S3 remote backend:
 
-1. **Configure Terraform backend (if required):**
-   ```bash
-   # Edit backend.tf with your S3 bucket details
-   # Or use local state for the interview
-   ```
+- Bucket: `devsecops-interview`
+- State key: `devsecops-interview-lab/terraform.tfstate`
+- Region: `us-west-2`
+- Server-side encryption: enabled
+- Native S3 state locking: enabled through `use_lockfile`
 
-2. **Deploy the provided Terraform configuration:**
-   ```bash
-   cd terraform/
-   terraform init
-   terraform plan
-   terraform apply
-   ```
+The S3 bucket must exist before running `terraform init`. GitHub Actions authenticates to AWS using OIDC and accesses the backend through `DevSecOpsLabTerraformRole`.
 
-2. **Configure kubectl access:**
-   ```bash
-   aws eks update-kubeconfig --region us-west-2 --name eks-interview-lab
-   ```
+## 2. Build and push the image
 
-3. **Verify cluster is working:**
-   ```bash
-   kubectl get nodes
-   kubectl get pods -A
-   ```
+```bash
+export AWS_REGION=us-west-2
+export ECR_REPOSITORY="$(terraform -chdir=terraform output -raw ecr_repository_url)"
+export IMAGE_TAG="$(git rev-parse --short HEAD)"
+./scripts/build-and-push.sh
+```
 
-**Deliverable:** Working EKS cluster with kubectl access
+## 3. Deploy PostgreSQL and Flask
 
----
+`deploy.sh` generates strong random database and Flask secret values unless they are supplied through environment variables. Save custom values in a password manager, never in Git.
 
-### Database Deployment
-**Objective:** Deploy a stateful PostgreSQL database using Helm
+```bash
+export IMAGE_REPOSITORY="$ECR_REPOSITORY"
+export IMAGE_TAG
+./scripts/deploy.sh
+```
 
-1. **Install Helm (if not already installed):**
-   ```bash
-   # Install Helm
-   curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-   ```
+Verify:
 
-2. **Add PostgreSQL Helm repository:**
-   ```bash
-   helm repo add bitnami https://charts.bitnami.com/bitnami
-   helm repo update
-   ```
+```bash
+kubectl get pods -A
+kubectl -n vulnerable-app port-forward svc/vulnerable-app 5000:80
+curl http://127.0.0.1:5000/healthz
+```
 
-3. **Deploy PostgreSQL using Helm with:**
-   - Use the provided `database/postgres-values.yaml` as a starting point
-   - Customize values for your requirements
-   - Persistent storage (at least 10GB)
-   - Custom database name and user
-   - Proper secrets management
-   - Health checks enabled
+## 4. Enable ALB and WAF
 
-4. **Import test data:**
-   ```bash
-   # Copy the init script to the pod
-   kubectl cp database/init-db.sql <postgres-pod>:/tmp/init-db.sql
-   
-   # Execute the initialization script
-   kubectl exec -it <postgres-pod> -- psql -U postgres -d vulnerable_app -f /tmp/init-db.sql
-   ```
+Install the AWS Load Balancer Controller using its official EKS instructions. Then:
 
-5. **Test database connectivity and verify data:**
-   ```bash
-   # Test connection
-   kubectl exec -it <postgres-pod> -- psql -U <username> -d <database> -c "SELECT version();"
-   
-   # Verify test data was imported
-   kubectl exec -it <postgres-pod> -- psql -U <username> -d <database> -c "SELECT COUNT(*) FROM users;"
-   kubectl exec -it <postgres-pod> -- psql -U <username> -d <database> -c "SELECT COUNT(*) FROM posts;"
-   kubectl exec -it <postgres-pod> -- psql -U <username> -d <database> -c "SELECT COUNT(*) FROM comments;"
-   ```
+```bash
+cp kubernetes/ingress.yaml.example kubernetes/ingress.yaml
+WAF_ACL_ARN="$(terraform -chdir=terraform output -raw waf_web_acl_arn)"
+sed -i.bak "s#REPLACE_WITH_WAF_ACL_ARN#${WAF_ACL_ARN}#" kubernetes/ingress.yaml
+kubectl apply -f kubernetes/ingress.yaml
+kubectl -n vulnerable-app get ingress
+```
 
-**Deliverable:** Working PostgreSQL database deployed via Helm with persistent storage
+For production-like use, configure HTTPS with ACM and redirect HTTP to HTTPS. HTTP is retained here to keep the interview lab focused and inexpensive.
 
----
-## Interview Tasks
-### 1: Vulnerable Application (60 minutes)
-**Objective:** Deploy and test a vulnerable web application
+## 5. Test and capture evidence
 
-1. **Deploy the provided vulnerable Flask application:**
-   - Build the Docker image from `app/` directory
-   - Create Kubernetes manifests
-   - Connect to the PostgreSQL database
-   - Expose the application
+First test the direct port-forward to demonstrate the vulnerabilities. Then set `BASE_URL` to the ALB URL and repeat to demonstrate WAF protection.
 
-2. **Test the application:**
-   ```bash
-   kubectl port-forward svc/<app-service> 5000:80
-   curl http://localhost:5000
-   ```
+```bash
+BASE_URL=http://127.0.0.1:5000 ./scripts/security-test.sh
+BASE_URL=http://YOUR_ALB_DNS_NAME ./scripts/security-test.sh
+```
 
-3. **Identify and test vulnerabilities:**
-   
-   **SQL Injection Testing:**
-   ```bash
-   # Test basic SQL injection in search
-   curl "http://localhost:5000/search?q=' OR '1'='1"
-   curl "http://localhost:5000/search?q=' UNION SELECT 1,2,3,4--"
-   curl "http://localhost:5000/search?q='; DROP TABLE users;--"
-   ```
-   
-   **XSS Testing:**
-   ```bash
-   # Test stored XSS in comments
-   curl -X POST "http://localhost:5000/comment" \
-     -d "author=test&content=<script>alert('XSS')</script>"
-   curl -X POST "http://localhost:5000/comment" \
-     -d "author=test&content=<img src=x onerror=alert('XSS')>"
-   ```
-   
-   **Authentication Bypass:**
-   ```bash
-   # Test IP-based admin bypass
-   curl "http://localhost:5000/admin" -H "X-Forwarded-For: 127.0.0.1"
-   curl "http://localhost:5000/admin" -H "X-Real-IP: 127.0.0.1"
-   ```
-   
-   **Information Disclosure:**
-   ```bash
-   # Test debug endpoint
-   curl "http://localhost:5000/debug"
-   
-   # Test user information access
-   curl "http://localhost:5000/user/1"
-   curl "http://localhost:5000/user/2"
-   ```
-   
-   **Document your findings:**
-   - Which vulnerabilities did you find?
-   - What attack vectors work?
-   - What data can you access?
-   - How would you exploit these in a real scenario?
+Expected result: direct SQLi/XSS requests reach the app; equivalent WAF-routed requests are blocked, normally with HTTP 403. Results are written under `reports/`.
 
-**Deliverable:** Working vulnerable application with identified security issues
+## 6. CI/CD behavior
 
-## Submission Requirements
+`.github/workflows/devsecops.yml` validates Python, Terraform, Kubernetes rendering, and the Docker build. Bandit, Trivy, and Checkov intentionally report findings because the target application is vulnerable. Scan steps collect artifacts rather than fail immediately so the lab produces evidence. In a normal repository, set severity thresholds and nonzero exit codes to enforce policy gates.
 
-1. **Working environment** with all components deployed
-2. **Documentation** of your approach and decisions
-3. **Security testing results** showing vulnerabilities and protection
-4. **WAF configuration** with explanation of rules
-5. **Cleanup script** to destroy resources
+## 7. Cleanup
 
-## Tips for Success
+Review the active AWS account and Terraform plan first:
 
-1. **Start simple** and build complexity gradually
-2. **Document everything** as you go
-3. **Test frequently** to catch issues early
-4. **Research WAF options** before implementing (open source vs AWS WAF)
-5. **Consider your environment** - AWS WAF for cloud-native, open source for flexibility
-6. **Focus on security** over features
-7. **Be prepared to explain** your decisions
+```bash
+terraform -chdir=terraform plan -destroy
+CONFIRM_DESTROY=yes ./scripts/cleanup.sh
+```
 
-## Resources
+## Repository map
 
-- [Kubernetes Documentation](https://kubernetes.io/docs/)
-- [AWS EKS Documentation](https://docs.aws.amazon.com/eks/)
-- [Helm Documentation](https://helm.sh/docs/)
-- [Bitnami PostgreSQL Chart](https://github.com/bitnami/charts/tree/main/bitnami/postgresql)
-- [AWS WAF Documentation](https://docs.aws.amazon.com/waf/)
-- [AWS WAF Managed Rules](https://docs.aws.amazon.com/waf/latest/developerguide/aws-managed-rule-groups.html)
-- [OWASP Web Application Security](https://owasp.org/www-project-web-security-testing-guide/)
-- [ModSecurity Documentation](https://github.com/SpiderLabs/ModSecurity)
+| Path | Purpose |
+|---|---|
+| `app/` | Vulnerable Flask source and non-root container image |
+| `database/` | PostgreSQL Helm values and PostgreSQL-compatible test data |
+| `terraform/` | VPC, EKS, KMS, ECR, WAF, logging, and outputs |
+| `kubernetes/base/` | Kustomize application and security manifests |
+| `scripts/` | Build, deployment, validation, security testing, and cleanup |
+| `.github/workflows/` | DevSecOps validation and scan pipeline |
+| `docs/` | Assignment, test data, findings, and interview notes |
+
+## Interview discussion points
+
+- WAF is compensating control, not a replacement for fixing application code.
+- A public EKS endpoint is convenient for the lab; production should restrict its CIDRs or use private access.
+- The default lab configuration removes the NAT Gateway and uses public worker subnets to minimize cost. Production should use private workers, NAT Gateways or VPC endpoints, and stronger network isolation.
+- Secrets are generated at deployment time; production should use AWS Secrets Manager with External Secrets or Secrets Store CSI.
+- The intentionally vulnerable image should never be promoted beyond a dedicated lab environment.

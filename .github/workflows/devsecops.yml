@@ -1,0 +1,245 @@
+name: DevSecOps CI
+
+on:
+  workflow_dispatch:
+
+  pull_request:
+    branches:
+      - main
+
+  push:
+    branches:
+      - main
+      - feature/fix-issues
+
+concurrency:
+  group: devsecops-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate application and infrastructure
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: latest
+
+      - name: Validate Python syntax
+        run: python -m py_compile app/app.py
+
+      - name: Check Terraform formatting
+        run: terraform -chdir=terraform fmt -check -recursive
+
+      - name: Initialize Terraform without backend
+        run: terraform -chdir=terraform init -backend=false
+
+      - name: Validate Terraform
+        run: terraform -chdir=terraform validate
+
+      - name: Render Kubernetes manifests
+        run: kubectl kustomize kubernetes/base > rendered.yaml
+
+      - name: Build application image
+        run: |
+          docker build \
+            --tag "vulnerable-app:${GITHUB_SHA}" \
+            app
+
+      - name: Upload rendered Kubernetes manifests
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rendered-kubernetes-manifests
+          path: rendered.yaml
+          if-no-files-found: warn
+          retention-days: 7
+
+  security-scans:
+    name: Run DevSecOps security scans
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Bandit
+        run: python -m pip install --disable-pip-version-check bandit
+
+      - name: Run Bandit SAST
+        id: bandit
+        continue-on-error: true
+        run: |
+          bandit \
+            --recursive app \
+            --format json \
+            --output bandit.json
+
+      - name: Run Trivy repository scan
+        id: trivy
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+          ignore-unfixed: false
+
+      - name: Run Checkov IaC scan
+        id: checkov
+        continue-on-error: true
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          output_format: cli,json
+          output_file_path: console,checkov.json
+
+      - name: Create scan summary
+        if: always()
+        run: |
+          {
+            echo "## DevSecOps scan summary"
+            echo
+            echo "| Scanner | Step result |"
+            echo "|---|---|"
+            echo "| Bandit | ${{ steps.bandit.outcome }} |"
+            echo "| Trivy | ${{ steps.trivy.outcome }} |"
+            echo "| Checkov | ${{ steps.checkov.outcome }} |"
+            echo
+            echo "The application is intentionally vulnerable, so findings are expected."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: security-reports
+          path: |
+            bandit.json
+            checkov.json
+            trivy.sarif
+          if-no-files-found: warn
+          retention-days: 7
+
+  terraform-plan:
+    name: Create Terraform plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    needs:
+      - validate
+      - security-scans
+
+    # Pull requests run validation and scanning, but do not receive AWS access.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::854481201284:role/DevSecOpsLabTerraformRole
+          aws-region: us-west-2
+          role-session-name: devsecops-terraform-plan
+
+      - name: Verify assumed AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Verify backend configuration
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: |
+          if [ -z "$TF_STATE_BUCKET" ]; then
+            echo "Repository variable TF_STATE_BUCKET is not configured."
+            exit 1
+          fi
+
+          echo "Using Terraform state bucket: $TF_STATE_BUCKET"
+
+      - name: Prepare Terraform variables
+        run: |
+          cp terraform/terraform.tfvars.example \
+             terraform/terraform.tfvars
+
+      - name: Initialize Terraform backend
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: |
+          terraform -chdir=terraform init \
+            -input=false \
+            -reconfigure \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=devsecops-interview-lab/terraform.tfstate" \
+            -backend-config="region=us-west-2" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: Create Terraform plan
+        run: |
+          terraform -chdir=terraform plan \
+            -input=false \
+            -lock-timeout=5m \
+            -var-file=terraform.tfvars \
+            -out=tfplan
+
+      - name: Create readable plan report
+        if: success()
+        run: |
+          terraform -chdir=terraform show \
+            -no-color tfplan > terraform/terraform-plan.txt
+
+      - name: Add plan summary
+        if: success()
+        run: |
+          {
+            echo "## Terraform plan"
+            echo
+            echo "Terraform successfully created an infrastructure plan."
+            echo
+            echo "Download the terraform-plan-report artifact to review it."
+            echo
+            echo "No infrastructure was applied by this workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Terraform plan report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: terraform-plan-report
+          path: terraform/terraform-plan.txt
+          if-no-files-found: warn
+          retention-days: 7

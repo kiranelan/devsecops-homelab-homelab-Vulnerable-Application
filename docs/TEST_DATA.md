@@ -31,12 +31,11 @@ This document describes the test data provided in `init-db.sql` for the DevSecOp
 ### Additional Objects
 
 - **user_posts** - View joining users and posts
-- **GetUserPosts** - Stored procedure for testing
-- **Indexes** - Performance indexes on key columns
+- **get_user_posts** - PostgreSQL SQL function for testing
 
 ## Test Data Included
 
-### Users (10 total)
+### Users (9 total)
 - **admin** - Admin user with elevated privileges
 - **user1, user2** - Regular users for testing
 - **testuser** - Additional test user
@@ -50,7 +49,7 @@ This document describes the test data provided in `init-db.sql` for the DevSecOp
 - Load testing posts
 - Posts with sensitive information
 
-### Comments (20+ total)
+### Comments (6 total)
 - Normal comments for legitimate testing
 - XSS test comments with malicious scripts
 - Comments for load testing
@@ -115,11 +114,10 @@ Candidates can:
 ## Database Statistics
 
 After initialization:
-- **Users**: 10 total
+- **Users**: 9 total
 - **Posts**: 11 total  
-- **Comments**: 20+ total
+- **Comments**: 6 total
 - **Views**: 1 (user_posts)
-- **Procedures**: 1 (GetUserPosts)
-- **Indexes**: 3 performance indexes
+- **Functions**: 1 (get_user_posts)
 
 This provides a realistic dataset for comprehensive security testing and evaluation.
