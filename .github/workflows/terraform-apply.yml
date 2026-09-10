@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: 'Type APPLY to confirm infrastructure deployment'
+        description: "Type APPLY to confirm infrastructure deployment"
         required: true
         type: string
 
@@ -18,16 +18,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
-    # Deployment is permitted only from the approved feature branch
-    # and only when the operator enters the exact confirmation value.
+    # Deployment is permitted only from main and requires explicit confirmation.
     if: >
-      github.ref == 'refs/heads/main' && inputs.confirmation == 'APPLY'
+      github.ref == 'refs/heads/main' &&
+      inputs.confirmation == 'APPLY'
 
     environment: lab
 
     permissions:
       id-token: write
       contents: read
+
+    env:
+      TF_IN_AUTOMATION: "true"
 
     steps:
       - name: Checkout repository
@@ -74,17 +77,25 @@ jobs:
             -out=tfplan
 
       - name: Create plan reports
+        working-directory: terraform
         run: |
-          terraform -chdir=terraform show \
-            -no-color tfplan > terraform/terraform-apply-plan.txt
+          test -f tfplan
 
-          terraform -chdir=terraform show \
-            -json tfplan > terraform/tfplan.json
+          terraform show \
+            -no-color tfplan > terraform-plan.txt
+
+          terraform show \
+            -json tfplan > terraform-plan.json
+
+          test -s terraform-plan.txt
+          test -s terraform-plan.json
 
       - name: Enforce deployment safety checks
         run: |
           PLAN_JSON="terraform/terraform-plan.json"
           ALLOWED_FAILED_NODE_GROUP='module.eks.module.eks_managed_node_group["default"].aws_eks_node_group.this[0]'
+
+          test -s "$PLAN_JSON"
 
           CREATE_COUNT="$(
             jq '
@@ -196,7 +207,34 @@ jobs:
                 | select(.change.actions | index("create"))
               ]
               | length
-            ' tfplan.json
+            ' terraform-plan.json
+          )"
+
+          DELETE_COUNT="$(
+            jq '
+              [
+                .resource_changes[]?
+                | select(.change.actions | index("delete"))
+              ]
+              | length
+            ' terraform-plan.json
+          )"
+
+          NAT_GATEWAY_CREATE_COUNT="$(
+            jq '
+              [
+                .resource_changes[]?
+                | select(.type == "aws_nat_gateway")
+                | select(.change.actions | index("create"))
+              ]
+              | length
+            ' terraform-plan.json
+          )"
+
+          WORKER_SUBNET_MODE="$(
+            jq -r '
+              .planned_values.outputs.worker_subnet_mode.value // "unknown"
+            ' terraform-plan.json
           )"
 
           {
@@ -205,11 +243,11 @@ jobs:
             echo "- Commit: \`${GITHUB_SHA}\`"
             echo "- Branch: \`${GITHUB_REF_NAME}\`"
             echo "- Resources to create: \`${CREATE_COUNT}\`"
-            echo "- Resources to delete or replace: \`0\`"
-            echo "- NAT Gateways to create: \`0\`"
-            echo "- Worker subnet mode: \`public-without-nat\`"
+            echo "- Resources to delete or replace: \`${DELETE_COUNT}\`"
+            echo "- NAT Gateways to create: \`${NAT_GATEWAY_CREATE_COUNT}\`"
+            echo "- Worker subnet mode: \`${WORKER_SUBNET_MODE}\`"
             echo
-            echo "The saved plan from this job will be applied."
+            echo "The exact saved plan reviewed by the safety checks will be applied."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Apply reviewed Terraform plan
@@ -221,9 +259,10 @@ jobs:
 
       - name: Capture Terraform outputs
         if: success()
+        working-directory: terraform
         run: |
-          terraform -chdir=terraform output \
-            -no-color > terraform/terraform-outputs.txt
+          terraform output \
+            -no-color > terraform-outputs.txt
 
       - name: Add deployment result
         if: success()
@@ -234,7 +273,8 @@ jobs:
             echo
             echo "Terraform apply completed successfully."
             echo
-            echo "Review the terraform-deployment-evidence artifact for outputs."
+            echo
+            echo "Review the terraform-deployment-evidence artifact for the plan and outputs."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload deployment evidence
@@ -243,7 +283,7 @@ jobs:
         with:
           name: terraform-deployment-evidence
           path: |
-            terraform/terraform-apply-plan.txt
+            terraform/terraform-plan.txt
             terraform/terraform-outputs.txt
           if-no-files-found: warn
           retention-days: 7
