@@ -1,0 +1,212 @@
+name: Terraform Apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 'Type APPLY to confirm infrastructure deployment'
+        required: true
+        type: string
+
+concurrency:
+  group: terraform-apply-lab
+  cancel-in-progress: false
+
+jobs:
+  terraform-apply:
+    name: Plan and apply Terraform infrastructure
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    # Deployment is permitted only from the approved feature branch
+    # and only when the operator enters the exact confirmation value.
+    if: >
+      github.ref == 'refs/heads/feature/fix-issues' &&
+      inputs.confirmation == 'APPLY'
+
+    environment: lab
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::854481201284:role/DevSecOpsLabTerraformRole
+          aws-region: us-west-2
+          role-session-name: devsecops-terraform-apply
+
+      - name: Verify assumed AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Prepare Terraform variables
+        run: |
+          cp terraform/terraform.tfvars.example \
+             terraform/terraform.tfvars
+
+      - name: Initialize Terraform backend
+        run: |
+          terraform -chdir=terraform init \
+            -input=false \
+            -reconfigure
+
+      - name: Validate Terraform
+        run: |
+          terraform -chdir=terraform fmt -check -recursive
+          terraform -chdir=terraform validate
+
+      - name: Create deployment plan
+        run: |
+          terraform -chdir=terraform plan \
+            -input=false \
+            -lock-timeout=5m \
+            -var-file=terraform.tfvars \
+            -out=tfplan
+
+      - name: Create plan reports
+        run: |
+          terraform -chdir=terraform show \
+            -no-color tfplan > terraform/terraform-apply-plan.txt
+
+          terraform -chdir=terraform show \
+            -json tfplan > terraform/tfplan.json
+
+      - name: Enforce deployment safety checks
+        working-directory: terraform
+        run: |
+          DELETE_COUNT="$(
+            jq '
+              [
+                .resource_changes[]?
+                | select(.change.actions | index("delete"))
+              ]
+              | length
+            ' tfplan.json
+          )"
+
+          NAT_COUNT="$(
+            jq '
+              [
+                .resource_changes[]?
+                | select(
+                    .type == "aws_nat_gateway"
+                    and (.change.actions | index("create"))
+                  )
+              ]
+              | length
+            ' tfplan.json
+          )"
+
+          WORKER_SUBNET_MODE="$(
+            jq -r \
+              '.planned_values.outputs.worker_subnet_mode.value // "unknown"' \
+              tfplan.json
+          )"
+
+          CREATE_COUNT="$(
+            jq '
+              [
+                .resource_changes[]?
+                | select(.change.actions | index("create"))
+              ]
+              | length
+            ' tfplan.json
+          )"
+
+          echo "Resources to create: $CREATE_COUNT"
+          echo "Resources to delete or replace: $DELETE_COUNT"
+          echo "NAT Gateways to create: $NAT_COUNT"
+          echo "Worker subnet mode: $WORKER_SUBNET_MODE"
+
+          if [ "$DELETE_COUNT" -ne 0 ]; then
+            echo "Deployment blocked: plan contains deletion or replacement actions."
+            exit 1
+          fi
+
+          if [ "$NAT_COUNT" -ne 0 ]; then
+            echo "Deployment blocked: plan attempts to create a NAT Gateway."
+            exit 1
+          fi
+
+          if [ "$WORKER_SUBNET_MODE" != "public-without-nat" ]; then
+            echo "Deployment blocked: unexpected worker subnet mode."
+            exit 1
+          fi
+
+          if [ "$CREATE_COUNT" -eq 0 ]; then
+            echo "Deployment blocked: plan contains no resources to create."
+            exit 1
+          fi
+
+      - name: Add deployment plan summary
+        working-directory: terraform
+        run: |
+          CREATE_COUNT="$(
+            jq '
+              [
+                .resource_changes[]?
+                | select(.change.actions | index("create"))
+              ]
+              | length
+            ' tfplan.json
+          )"
+
+          {
+            echo "## Terraform deployment plan"
+            echo
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Branch: \`${GITHUB_REF_NAME}\`"
+            echo "- Resources to create: \`${CREATE_COUNT}\`"
+            echo "- Resources to delete or replace: \`0\`"
+            echo "- NAT Gateways to create: \`0\`"
+            echo "- Worker subnet mode: \`public-without-nat\`"
+            echo
+            echo "The saved plan from this job will be applied."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply reviewed Terraform plan
+        run: |
+          terraform -chdir=terraform apply \
+            -input=false \
+            -lock-timeout=5m \
+            tfplan
+
+      - name: Capture Terraform outputs
+        if: success()
+        run: |
+          terraform -chdir=terraform output \
+            -no-color > terraform/terraform-outputs.txt
+
+      - name: Add deployment result
+        if: success()
+        run: |
+          {
+            echo
+            echo "## Deployment result"
+            echo
+            echo "Terraform apply completed successfully."
+            echo
+            echo "Review the terraform-deployment-evidence artifact for outputs."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload deployment evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: terraform-deployment-evidence
+          path: |
+            terraform/terraform-apply-plan.txt
+            terraform/terraform-outputs.txt
+          if-no-files-found: warn
+          retention-days: 7
