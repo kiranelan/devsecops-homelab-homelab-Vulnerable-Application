@@ -6,6 +6,17 @@ module "eks" {
   kubernetes_version = var.cluster_version
   vpc_id             = module.vpc.vpc_id
 
+  ## Addons for Amazon VPC CNI
+  addons = {
+    coredns = {}
+
+    kube-proxy = {}
+
+    vpc-cni = {
+      before_compute = true
+    }
+  }
+
   # Private nodes are used with NAT. The explicit no-NAT lab mode uses public
   # subnets so that node bootstrap and image pulls continue to work.
   subnet_ids = var.enable_nat_gateway ? module.vpc.private_subnets : module.vpc.public_subnets
