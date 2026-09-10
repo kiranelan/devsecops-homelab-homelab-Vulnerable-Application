@@ -59,6 +59,11 @@ jobs:
           terraform -chdir=terraform init \
             -input=false \
             -reconfigure
+      
+      - name: Clear taint from partially configured default network ACL
+        run: |
+          terraform -chdir=terraform untaint \
+            'module.vpc.aws_default_network_acl.this[0]'
 
       - name: Validate Terraform
         run: |
