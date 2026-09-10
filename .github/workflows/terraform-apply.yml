@@ -21,8 +21,7 @@ jobs:
     # Deployment is permitted only from the approved feature branch
     # and only when the operator enters the exact confirmation value.
     if: >
-      github.ref == 'refs/heads/feature/fix-issues' &&
-      inputs.confirmation == 'APPLY'
+      github.ref == 'refs/heads/main' && inputs.confirmation == 'APPLY'
 
     environment: lab
 
