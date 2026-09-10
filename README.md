@@ -47,7 +47,17 @@ aws eks update-kubeconfig \
 kubectl get nodes
 ```
 
-If using remote state, copy `terraform/backend.example.tf` to `terraform/backend.tf` and replace its placeholders before `terraform init`.
+### Terraform remote state
+
+Terraform uses the existing S3 remote backend:
+
+- Bucket: `devsecops-interview`
+- State key: `devsecops-interview-lab/terraform.tfstate`
+- Region: `us-west-2`
+- Server-side encryption: enabled
+- Native S3 state locking: enabled through `use_lockfile`
+
+The S3 bucket must exist before running `terraform init`. GitHub Actions authenticates to AWS using OIDC and accesses the backend through `DevSecOpsLabTerraformRole`.
 
 ## 2. Build and push the image
 
