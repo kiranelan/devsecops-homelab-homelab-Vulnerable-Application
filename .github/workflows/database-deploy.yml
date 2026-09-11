@@ -320,6 +320,45 @@ jobs:
           test "$PVC_SIZE" = "10Gi"
           test "$STORAGE_CLASS" = "gp3-encrypted"
 
+      - name: Initialize database when schema is absent
+        shell: bash
+        run: |
+          USERS_TABLE_EXISTS="$(
+            kubectl exec \
+              --namespace database \
+              statefulset/postgres \
+              -- \
+              env "PGPASSWORD=${POSTGRES_PASSWORD}" \
+              psql \
+                --host=127.0.0.1 \
+                --username="$POSTGRES_USER" \
+                --dbname="$POSTGRES_DB" \
+                --tuples-only \
+                --no-align \
+                --command="SELECT to_regclass('public.users') IS NOT NULL;"
+          )"
+
+          if [ "$USERS_TABLE_EXISTS" = "t" ]; then
+            echo "Database schema already exists; initialization skipped."
+          else
+            echo "Database schema is absent; initializing from database/init-db.sql."
+
+            test -s database/init-db.sql
+
+            kubectl exec \
+              --stdin \
+              --namespace database \
+              statefulset/postgres \
+              -- \
+              env "PGPASSWORD=${POSTGRES_PASSWORD}" \
+              psql \
+                --host=127.0.0.1 \
+                --username="$POSTGRES_USER" \
+                --dbname="$POSTGRES_DB" \
+                --set=ON_ERROR_STOP=1 \
+              < database/init-db.sql
+          fi
+
       - name: Restore database backup
         if: steps.database-state.outputs.installation == 'legacy'
         shell: bash
@@ -329,13 +368,16 @@ jobs:
             --namespace database \
             statefulset/postgres \
             -- \
+            env "PGPASSWORD=${POSTGRES_PASSWORD}" \
             pg_restore \
+              --host=127.0.0.1 \
               --username="$POSTGRES_USER" \
               --dbname="$POSTGRES_DB" \
               --clean \
               --if-exists \
               --no-owner \
               --no-privileges \
+              --exit-on-error \
             < postgres-migration-backup.dump
 
       - name: Verify initialized database
@@ -358,7 +400,6 @@ jobs:
           tee database-counts-after.txt
 
       - name: Scale Flask application up
-        if: steps.database-state.outputs.installation == 'legacy'
         run: |
           kubectl scale deployment/vulnerable-app \
             --namespace vulnerable-app \
@@ -369,7 +410,6 @@ jobs:
             --timeout=5m
 
       - name: Verify application readiness
-        if: steps.database-state.outputs.installation == 'legacy'
         shell: bash
         run: |
           APP_POD="$(
