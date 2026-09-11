@@ -1,0 +1,194 @@
+name: Build Scan and Publish Container
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type PUBLISH to build and push the application image"
+        required: true
+        type: string
+
+concurrency:
+  group: container-publish-lab
+  cancel-in-progress: false
+
+jobs:
+  publish-image:
+    name: Build scan and publish application image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    if: >
+      github.ref == 'refs/heads/main' &&
+      inputs.confirmation == 'PUBLISH'
+
+    environment: lab
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: us-west-2
+      ECR_REPOSITORY: eks-interview-lab/vulnerable-app
+      LOCAL_IMAGE: vulnerable-app:${{ github.sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::854481201284:role/DevSecOpsLabTerraformRole
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: devsecops-container-publish
+
+      - name: Verify assumed AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image URI
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"
+
+          echo "Publishing image: ${IMAGE_URI}"
+
+      - name: Check whether image already exists
+        id: existing-image
+        run: |
+          if aws ecr describe-images \
+            --region "$AWS_REGION" \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$GITHUB_SHA" \
+            >/dev/null 2>&1; then
+
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Image tag ${GITHUB_SHA} already exists in ECR."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Image tag ${GITHUB_SHA} does not exist. A new image will be published."
+          fi
+
+      - name: Build application image
+        if: steps.existing-image.outputs.exists == 'false'
+        run: |
+          docker build \
+            --tag "$LOCAL_IMAGE" \
+            app
+
+      - name: Test container health endpoint
+        if: steps.existing-image.outputs.exists == 'false'
+        run: |
+          CONTAINER_ID="$(
+            docker run \
+              --detach \
+              --publish 127.0.0.1:5000:5000 \
+              "$LOCAL_IMAGE"
+          )"
+
+          cleanup() {
+            docker logs "$CONTAINER_ID" || true
+            docker rm --force "$CONTAINER_ID" >/dev/null 2>&1 || true
+          }
+
+          trap cleanup EXIT
+
+          for attempt in $(seq 1 20); do
+            if python -c \
+              "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/healthz', timeout=3)"; then
+              echo "Container health endpoint is responding."
+              exit 0
+            fi
+
+            echo "Waiting for container health endpoint: attempt ${attempt}/20"
+            sleep 3
+          done
+
+          echo "Container health endpoint did not become ready."
+          exit 1
+
+      - name: Scan application image with Trivy
+        if: steps.existing-image.outputs.exists == 'false'
+        id: trivy-image
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.LOCAL_IMAGE }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: "0"
+
+      - name: Tag application image for ECR
+        if: steps.existing-image.outputs.exists == 'false'
+        run: |
+          docker tag \
+            "$LOCAL_IMAGE" \
+            "$IMAGE_URI"
+
+      - name: Push application image to ECR
+        if: steps.existing-image.outputs.exists == 'false'
+        run: docker push "$IMAGE_URI"
+
+      - name: Verify published image
+        id: published-image
+        run: |
+          IMAGE_DIGEST="$(
+            aws ecr describe-images \
+              --region "$AWS_REGION" \
+              --repository-name "$ECR_REPOSITORY" \
+              --image-ids imageTag="$GITHUB_SHA" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text
+          )"
+
+          if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = "None" ]; then
+            echo "Unable to retrieve the published image digest."
+            exit 1
+          fi
+
+          echo "image_digest=${IMAGE_DIGEST}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "IMAGE_URI=${IMAGE_URI}"
+            echo "IMAGE_DIGEST=${IMAGE_DIGEST}"
+            echo "GIT_COMMIT=${GITHUB_SHA}"
+          } > container-image-evidence.txt
+
+      - name: Add publication summary
+        if: success()
+        run: |
+          {
+            echo "## Application container image"
+            echo
+            echo "- Repository: \`${ECR_REPOSITORY}\`"
+            echo "- Tag: \`${GITHUB_SHA}\`"
+            echo "- Digest: \`${{ steps.published-image.outputs.image_digest }}\`"
+            echo "- Region: \`${AWS_REGION}\`"
+            echo "- Existing image reused: \`${{ steps.existing-image.outputs.exists }}\`"
+            echo
+            echo "The image uses the immutable Git commit SHA as its tag."
+            echo "ECR scan-on-push is enabled on the repository."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload container evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: container-publish-evidence
+          path: |
+            container-image-evidence.txt
+            trivy-image.sarif
+          if-no-files-found: warn
+          retention-days: 7
