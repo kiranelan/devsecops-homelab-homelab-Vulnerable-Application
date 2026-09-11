@@ -1,0 +1,324 @@
+name: Terraform Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 'Type DESTROY to confirm permanent lab teardown'
+        required: true
+        type: string
+
+concurrency:
+  # Match terraform-apply.yml so apply and destroy can never overlap.
+  group: terraform-apply-lab
+  cancel-in-progress: false
+
+jobs:
+  terraform-destroy:
+    name: Remove Kubernetes workloads and destroy Terraform infrastructure
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    if: >
+      github.ref == 'refs/heads/main' && inputs.confirmation == 'DESTROY'
+
+    environment: lab
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: us-west-2
+      EKS_CLUSTER_NAME: eks-interview-lab
+      LBC_ROLE_NAME: AmazonEKSLoadBalancerControllerRole
+      LBC_POLICY_NAME: AWSLoadBalancerControllerIAMPolicy
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: latest
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: latest
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::854481201284:role/DevSecOpsLabTerraformRole
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: devsecops-terraform-destroy
+
+      - name: Verify assumed AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Prepare Terraform variables
+        run: |
+          cp terraform/terraform.tfvars.example \
+             terraform/terraform.tfvars
+
+      - name: Initialize Terraform backend
+        run: |
+          terraform -chdir=terraform init \
+            -input=false \
+            -reconfigure
+
+      - name: Capture Terraform resource identifiers
+        id: terraform-resources
+        run: |
+          VPC_ID="$(terraform -chdir=terraform output -raw vpc_id 2>/dev/null || true)"
+          echo "vpc_id=${VPC_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Connect kubectl to EKS
+        id: eks
+        continue-on-error: true
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+          kubectl get nodes
+
+      - name: Capture ALB identifier
+        if: steps.eks.outcome == 'success'
+        id: alb
+        run: |
+          ALB_HOSTNAME="$(
+            kubectl get ingress vulnerable-app \
+              --namespace vulnerable-app \
+              --output jsonpath='{.status.loadBalancer.ingress[0].hostname}' \
+              2>/dev/null || true
+          )"
+
+          ALB_ARN=""
+          if [ -n "$ALB_HOSTNAME" ]; then
+            ALB_ARN="$(
+              aws elbv2 describe-load-balancers \
+                --region "$AWS_REGION" \
+                --query "LoadBalancers[?DNSName=='${ALB_HOSTNAME}'].LoadBalancerArn | [0]" \
+                --output text
+            )"
+            if [ "$ALB_ARN" = "None" ]; then
+              ALB_ARN=""
+            fi
+          fi
+
+          echo "hostname=${ALB_HOSTNAME}" >> "$GITHUB_OUTPUT"
+          echo "arn=${ALB_ARN}" >> "$GITHUB_OUTPUT"
+
+      - name: Delete application Ingress and wait for ALB cleanup
+        if: steps.eks.outcome == 'success'
+        run: |
+          kubectl delete ingress vulnerable-app \
+            --namespace vulnerable-app \
+            --ignore-not-found=true \
+            --wait=true \
+            --timeout=15m
+
+          ALB_ARN='${{ steps.alb.outputs.arn }}'
+          if [ -n "$ALB_ARN" ]; then
+            aws elbv2 wait load-balancers-deleted \
+              --region "$AWS_REGION" \
+              --load-balancer-arns "$ALB_ARN"
+          fi
+
+      - name: Remove Kubernetes workloads
+        if: steps.eks.outcome == 'success'
+        run: |
+          kubectl delete namespace vulnerable-app \
+            --ignore-not-found=true \
+            --wait=true \
+            --timeout=10m
+
+          kubectl delete namespace database \
+            --ignore-not-found=true \
+            --wait=true \
+            --timeout=10m
+
+      - name: Uninstall AWS Load Balancer Controller
+        if: steps.eks.outcome == 'success'
+        run: |
+          if helm status aws-load-balancer-controller \
+            --namespace kube-system >/dev/null 2>&1; then
+            helm uninstall aws-load-balancer-controller \
+              --namespace kube-system \
+              --wait \
+              --timeout 10m
+          fi
+
+          kubectl delete serviceaccount aws-load-balancer-controller \
+            --namespace kube-system \
+            --ignore-not-found=true
+
+      - name: Create destroy plan
+        run: |
+          terraform -chdir=terraform plan \
+            -destroy \
+            -input=false \
+            -lock-timeout=5m \
+            -var-file=terraform.tfvars \
+            -out=tfdestroy
+
+      - name: Create destroy plan reports
+        working-directory: terraform
+        run: |
+          test -f tfdestroy
+          terraform show -no-color tfdestroy > terraform-destroy-plan.txt
+          terraform show -json tfdestroy > terraform-destroy-plan.json
+          test -s terraform-destroy-plan.txt
+          test -s terraform-destroy-plan.json
+
+      - name: Enforce destroy safety checks
+        run: |
+          PLAN_JSON="terraform/terraform-destroy-plan.json"
+
+          CREATE_COUNT="$(
+            jq '[.resource_changes[]? | select(.change.actions | index("create"))] | length' \
+              "$PLAN_JSON"
+          )"
+          UPDATE_COUNT="$(
+            jq '[.resource_changes[]? | select(.change.actions == ["update"])] | length' \
+              "$PLAN_JSON"
+          )"
+          DELETE_COUNT="$(
+            jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length' \
+              "$PLAN_JSON"
+          )"
+          STATE_BUCKET_COUNT="$(
+            jq '[.resource_changes[]? | select(.type == "aws_s3_bucket")] | length' \
+              "$PLAN_JSON"
+          )"
+
+          echo "Resources to create: $CREATE_COUNT"
+          echo "Resources to update: $UPDATE_COUNT"
+          echo "Resources to delete: $DELETE_COUNT"
+          echo "Terraform-managed S3 buckets in plan: $STATE_BUCKET_COUNT"
+
+          if [ "$CREATE_COUNT" -ne 0 ]; then
+            echo "Destroy blocked: plan contains create or replacement actions."
+            exit 1
+          fi
+
+          if [ "$UPDATE_COUNT" -ne 0 ]; then
+            echo "Destroy blocked: plan contains in-place updates."
+            exit 1
+          fi
+
+          if [ "$DELETE_COUNT" -eq 0 ]; then
+            echo "Destroy blocked: plan contains no deletions."
+            exit 1
+          fi
+
+          if [ "$STATE_BUCKET_COUNT" -ne 0 ]; then
+            echo "Destroy blocked: the remote-state bucket must be preserved."
+            exit 1
+          fi
+
+      - name: Add destroy plan summary
+        run: |
+          DELETE_COUNT="$(
+            jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length' \
+              terraform/terraform-destroy-plan.json
+          )"
+
+          {
+            echo "## Terraform destroy plan"
+            echo
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Branch: \`${GITHUB_REF_NAME}\`"
+            echo "- Resources to delete: \`${DELETE_COUNT}\`"
+            echo "- Resources to create: \`0\`"
+            echo "- Remote-state bucket: preserved"
+            echo "- Budget alert: preserved"
+            echo
+            echo "The saved destroy plan from this job will be applied."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply reviewed destroy plan
+        run: |
+          terraform -chdir=terraform apply \
+            -input=false \
+            -lock-timeout=5m \
+            tfdestroy
+
+      - name: Remove controller IAM resources
+        env:
+          LBC_POLICY_ARN: arn:aws:iam::854481201284:policy/AWSLoadBalancerControllerIAMPolicy
+        run: |
+          if aws iam get-role --role-name "$LBC_ROLE_NAME" >/dev/null 2>&1; then
+            aws iam detach-role-policy \
+              --role-name "$LBC_ROLE_NAME" \
+              --policy-arn "$LBC_POLICY_ARN" || true
+            aws iam delete-role --role-name "$LBC_ROLE_NAME"
+          fi
+
+          if aws iam get-policy --policy-arn "$LBC_POLICY_ARN" >/dev/null 2>&1; then
+            aws iam delete-policy --policy-arn "$LBC_POLICY_ARN"
+          fi
+
+      - name: Verify infrastructure removal
+        env:
+          VPC_ID: ${{ steps.terraform-resources.outputs.vpc_id }}
+        run: |
+          CLUSTER_STATUS="$(
+            aws eks describe-cluster \
+              --region "$AWS_REGION" \
+              --name "$EKS_CLUSTER_NAME" \
+              --query 'cluster.status' \
+              --output text 2>/dev/null || true
+          )"
+
+          if [ -n "$CLUSTER_STATUS" ]; then
+            echo "EKS cluster still exists with status: $CLUSTER_STATUS"
+            exit 1
+          fi
+
+          if [ -n "$VPC_ID" ]; then
+            VPC_COUNT="$(
+              aws ec2 describe-vpcs \
+                --region "$AWS_REGION" \
+                --vpc-ids "$VPC_ID" \
+                --query 'length(Vpcs)' \
+                --output text 2>/dev/null || echo 0
+            )"
+            if [ "$VPC_COUNT" != "0" ]; then
+              echo "VPC $VPC_ID still exists."
+              exit 1
+            fi
+          fi
+
+          terraform -chdir=terraform state list > terraform/remaining-state.txt
+          test ! -s terraform/remaining-state.txt
+
+      - name: Add destroy result
+        run: |
+          {
+            echo
+            echo "## Teardown result"
+            echo
+            echo "Terraform-managed lab infrastructure was removed successfully."
+            echo "The S3 remote-state bucket, budget alert, GitHub configuration,"
+            echo "and GitHub OIDC execution role were intentionally preserved."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload teardown evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: terraform-destroy-evidence
+          path: |
+            terraform/terraform-destroy-plan.txt
+            terraform/remaining-state.txt
+          if-no-files-found: warn
+          retention-days: 7
