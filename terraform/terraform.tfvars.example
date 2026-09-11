@@ -15,8 +15,8 @@ use_spot_instances    = true
 # Set to true only when private worker nodes and a single NAT Gateway are required.
 enable_nat_gateway = false
 
-# Keep WAF disabled until the ALB/WAF portion of the demonstration.
-enable_edge_security = false
+# Keep WAF disabled until the ALB/WAF portion of the demonstration. Enabling now
+enable_edge_security = true
 
 waf_log_retention_days = 1
 ecr_max_image_count    = 3
