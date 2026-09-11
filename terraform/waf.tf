@@ -8,6 +8,40 @@ resource "aws_wafv2_web_acl" "main" {
     allow {}
   }
 
+  # The application intentionally exposes environment and database
+  # configuration through /debug. Block this endpoint at the edge while
+  # retaining the vulnerable route in the source for interview demonstration.
+  rule {
+    name     = "BlockDebugEndpoint"
+    priority = 5
+
+    action {
+      block {}
+    }
+
+    statement {
+      byte_match_statement {
+        positional_constraint = "STARTS_WITH"
+        search_string         = "/debug"
+
+        field_to_match {
+          uri_path {}
+        }
+
+        text_transformation {
+          priority = 0
+          type     = "NONE"
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "BlockDebugEndpoint"
+      sampled_requests_enabled   = true
+    }
+  }
+
   rule {
     name     = "AWSManagedRulesCommonRuleSet"
     priority = 10
