@@ -22,7 +22,6 @@ jobs:
     if: >
       github.ref == 'refs/heads/main' &&
       inputs.confirmation == 'APPLY'
-
     environment: lab
 
     permissions:
@@ -93,7 +92,6 @@ jobs:
       - name: Enforce deployment safety checks
         run: |
           PLAN_JSON="terraform/terraform-plan.json"
-
           test -s "$PLAN_JSON"
 
           CREATE_COUNT="$(
@@ -106,11 +104,31 @@ jobs:
             ' "$PLAN_JSON"
           )"
 
+          UPDATE_COUNT="$(
+            jq '
+              [
+                .resource_changes[]?
+                | select(.change.actions | index("update"))
+              ]
+              | length
+            ' "$PLAN_JSON"
+          )"
+
           DELETE_COUNT="$(
             jq '
               [
                 .resource_changes[]?
                 | select(.change.actions | index("delete"))
+              ]
+              | length
+            ' "$PLAN_JSON"
+          )"
+
+          MUTATION_COUNT="$(
+            jq '
+              [
+                .resource_changes[]?
+                | select(.change.actions != ["no-op"])
               ]
               | length
             ' "$PLAN_JSON"
@@ -134,7 +152,9 @@ jobs:
           )"
 
           echo "Resources to create: $CREATE_COUNT"
+          echo "Resources to update: $UPDATE_COUNT"
           echo "Resources to delete or replace: $DELETE_COUNT"
+          echo "Resources with planned changes: $MUTATION_COUNT"
           echo "NAT Gateways to create: $NAT_GATEWAY_CREATE_COUNT"
           echo "Worker subnet mode: $WORKER_SUBNET_MODE"
 
@@ -153,9 +173,8 @@ jobs:
             exit 1
           fi
 
-          if [ "$CREATE_COUNT" -eq 0 ]; then
-            echo "Deployment blocked: plan contains no resource creation."
-            echo "Use the Terraform plan workflow to confirm whether infrastructure is already current."
+          if [ "$MUTATION_COUNT" -eq 0 ]; then
+            echo "Deployment blocked: plan contains no infrastructure changes."
             exit 1
           fi
 
@@ -167,6 +186,16 @@ jobs:
               [
                 .resource_changes[]?
                 | select(.change.actions | index("create"))
+              ]
+              | length
+            ' terraform-plan.json
+          )"
+
+          UPDATE_COUNT="$(
+            jq '
+              [
+                .resource_changes[]?
+                | select(.change.actions | index("update"))
               ]
               | length
             ' terraform-plan.json
@@ -205,11 +234,12 @@ jobs:
             echo "- Commit: \`${GITHUB_SHA}\`"
             echo "- Branch: \`${GITHUB_REF_NAME}\`"
             echo "- Resources to create: \`${CREATE_COUNT}\`"
+            echo "- Resources to update: \`${UPDATE_COUNT}\`"
             echo "- Resources to delete or replace: \`${DELETE_COUNT}\`"
             echo "- NAT Gateways to create: \`${NAT_GATEWAY_CREATE_COUNT}\`"
             echo "- Worker subnet mode: \`${WORKER_SUBNET_MODE}\`"
             echo
-            echo "The exact saved plan reviewed by the safety checks will be applied."
+            echo "The saved and safety-checked plan from this job will be applied."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Apply reviewed Terraform plan
@@ -221,10 +251,9 @@ jobs:
 
       - name: Capture Terraform outputs
         if: success()
-        working-directory: terraform
         run: |
-          terraform output \
-            -no-color > terraform-outputs.txt
+          terraform -chdir=terraform output \
+            -no-color > terraform/terraform-outputs.txt
 
       - name: Add deployment result
         if: success()
@@ -234,8 +263,6 @@ jobs:
             echo "## Deployment result"
             echo
             echo "Terraform apply completed successfully."
-            echo
-            echo
             echo "Review the terraform-deployment-evidence artifact for the plan and outputs."
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -246,6 +273,7 @@ jobs:
           name: terraform-deployment-evidence
           path: |
             terraform/terraform-plan.txt
+            terraform/terraform-plan.json
             terraform/terraform-outputs.txt
           if-no-files-found: warn
           retention-days: 7
