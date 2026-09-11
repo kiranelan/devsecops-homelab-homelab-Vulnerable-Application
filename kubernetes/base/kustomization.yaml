@@ -11,4 +11,4 @@ resources:
 images:
   - name: vulnerable-flask
     newName: 854481201284.dkr.ecr.us-west-2.amazonaws.com/eks-interview-lab/vulnerable-app
-    digest: sha256:55d7a4241c3aadc90a74089953c498b33b401195dc5bb94ef66ad7acb2227adc
+    digest: sha256:ecfa671ea77b6cc809fd51f2a6f436886efd35214ef85946a545375b8f837e9a
