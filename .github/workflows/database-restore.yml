@@ -1,0 +1,302 @@
+name: Restore PostgreSQL Migration Backup
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Workflow run ID containing the encrypted backup"
+        required: true
+        default: "34566130699"
+        type: string
+
+      confirmation:
+        description: "Type RESTORE to confirm database restoration"
+        required: true
+        type: string
+
+concurrency:
+  group: database-deploy-lab
+  cancel-in-progress: false
+
+jobs:
+  restore-database:
+    name: Restore PostgreSQL and recover Flask
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    if: >
+      github.ref == 'refs/heads/main' &&
+      inputs.confirmation == 'RESTORE'
+
+    environment: lab
+
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+
+    env:
+      AWS_REGION: us-west-2
+      EKS_CLUSTER_NAME: eks-interview-lab
+      POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+      POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+      POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::854481201284:role/DevSecOpsLabTerraformRole
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: devsecops-database-restore
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: latest
+
+      - name: Configure EKS access
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+          kubectl get nodes
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          test -n "$POSTGRES_DB" || {
+            echo "POSTGRES_DB is not configured."
+            exit 1
+          }
+
+          test -n "$POSTGRES_USER" || {
+            echo "POSTGRES_USER is not configured."
+            exit 1
+          }
+
+          test -n "$POSTGRES_PASSWORD" || {
+            echo "POSTGRES_PASSWORD is not configured."
+            exit 1
+          }
+
+          test -n "$POSTGRES_ADMIN_PASSWORD" || {
+            echo "POSTGRES_ADMIN_PASSWORD is not configured."
+            exit 1
+          }
+
+          echo "::add-mask::$POSTGRES_PASSWORD"
+          echo "::add-mask::$POSTGRES_ADMIN_PASSWORD"
+
+      - name: Download encrypted migration backup
+        uses: actions/download-artifact@v7
+        with:
+          name: postgres-helm-migration-evidence
+          path: recovery
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Verify downloaded artifact
+        run: |
+          find recovery \
+            -maxdepth 2 \
+            -type f \
+            -printf '%P\n'
+
+          test -s recovery/postgres-migration-backup.dump.enc
+          test -s recovery/postgres-migration-backup.sha256
+          test -s recovery/database-counts-before.txt
+
+      - name: Decrypt migration backup
+        shell: bash
+        run: |
+          openssl enc \
+            -decrypt \
+            -aes-256-cbc \
+            -pbkdf2 \
+            -in recovery/postgres-migration-backup.dump.enc \
+            -out recovery/postgres-migration-backup.dump \
+            -pass env:POSTGRES_ADMIN_PASSWORD
+
+          test -s recovery/postgres-migration-backup.dump
+
+          pg_restore \
+            --list \
+            recovery/postgres-migration-backup.dump \
+            > recovery/postgres-migration-restore.list
+
+          test -s recovery/postgres-migration-restore.list
+
+      - name: Verify Helm PostgreSQL readiness
+        run: |
+          kubectl rollout status statefulset/postgres \
+            --namespace database \
+            --timeout=10m
+
+          kubectl get statefulset,pod,service,pvc \
+            --namespace database \
+            --output=wide
+
+      - name: Verify PostgreSQL authentication
+        shell: bash
+        run: |
+          kubectl exec \
+            --namespace database \
+            statefulset/postgres \
+            -- \
+            env "PGPASSWORD=${POSTGRES_PASSWORD}" \
+            psql \
+              --host=127.0.0.1 \
+              --username="$POSTGRES_USER" \
+              --dbname="$POSTGRES_DB" \
+              --set=ON_ERROR_STOP=1 \
+              --command="SELECT current_database(), current_user;"
+
+      - name: Restore PostgreSQL backup
+        shell: bash
+        run: |
+          kubectl exec \
+            --stdin \
+            --namespace database \
+            statefulset/postgres \
+            -- \
+            env "PGPASSWORD=${POSTGRES_PASSWORD}" \
+            pg_restore \
+              --host=127.0.0.1 \
+              --username="$POSTGRES_USER" \
+              --dbname="$POSTGRES_DB" \
+              --clean \
+              --if-exists \
+              --no-owner \
+              --no-privileges \
+              --exit-on-error \
+            < recovery/postgres-migration-backup.dump
+
+      - name: Verify restored table counts
+        shell: bash
+        run: |
+          kubectl exec \
+            --namespace database \
+            statefulset/postgres \
+            -- \
+            env "PGPASSWORD=${POSTGRES_PASSWORD}" \
+            psql \
+              --host=127.0.0.1 \
+              --username="$POSTGRES_USER" \
+              --dbname="$POSTGRES_DB" \
+              --set=ON_ERROR_STOP=1 \
+              --command="
+                SELECT 'users' AS table_name, COUNT(*) AS row_count
+                FROM users
+                UNION ALL
+                SELECT 'posts', COUNT(*) FROM posts
+                UNION ALL
+                SELECT 'comments', COUNT(*) FROM comments;
+              " |
+          tee recovery/database-counts-after.txt
+
+      - name: Scale Flask application up
+        run: |
+          kubectl scale deployment/vulnerable-app \
+            --namespace vulnerable-app \
+            --replicas=1
+
+          kubectl rollout status deployment/vulnerable-app \
+            --namespace vulnerable-app \
+            --timeout=5m
+
+      - name: Verify Flask readiness
+        shell: bash
+        run: |
+          APP_POD="$(
+            kubectl get pods \
+              --namespace vulnerable-app \
+              --selector=app.kubernetes.io/name=vulnerable-app \
+              --field-selector=status.phase=Running \
+              --sort-by=.metadata.creationTimestamp \
+              --output=jsonpath='{.items[-1:].metadata.name}'
+          )"
+
+          test -n "$APP_POD"
+
+          kubectl exec \
+            --namespace vulnerable-app \
+            "$APP_POD" \
+            -- \
+            python -c \
+              'import urllib.request; response = urllib.request.urlopen("http://127.0.0.1:5000/readyz"); assert response.status == 200; print(response.read().decode())'
+
+      - name: Verify persistent volume
+        shell: bash
+        run: |
+          PVC_NAME="$(
+            kubectl get persistentvolumeclaim \
+              --namespace database \
+              --output=jsonpath='{.items[0].metadata.name}'
+          )"
+
+          PVC_STATUS="$(
+            kubectl get persistentvolumeclaim "$PVC_NAME" \
+              --namespace database \
+              --output=jsonpath='{.status.phase}'
+          )"
+
+          PVC_SIZE="$(
+            kubectl get persistentvolumeclaim "$PVC_NAME" \
+              --namespace database \
+              --output=jsonpath='{.spec.resources.requests.storage}'
+          )"
+
+          STORAGE_CLASS="$(
+            kubectl get persistentvolumeclaim "$PVC_NAME" \
+              --namespace database \
+              --output=jsonpath='{.spec.storageClassName}'
+          )"
+
+          echo "PVC: $PVC_NAME"
+          echo "Status: $PVC_STATUS"
+          echo "Size: $PVC_SIZE"
+          echo "StorageClass: $STORAGE_CLASS"
+
+          test "$PVC_STATUS" = "Bound"
+          test "$PVC_SIZE" = "10Gi"
+          test "$STORAGE_CLASS" = "gp3-encrypted"
+
+      - name: Add recovery summary
+        if: success()
+        run: |
+          {
+            echo "## PostgreSQL migration recovery"
+            echo
+            echo "- Source run: \`${{ inputs.source_run_id }}\`"
+            echo "- Encrypted backup downloaded and decrypted"
+            echo "- Database backup restored"
+            echo "- Table counts verified"
+            echo "- Flask scaled to one replica"
+            echo "- Flask readiness verified"
+            echo "- Persistent volume: \`10Gi gp3-encrypted\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show diagnostics
+        if: failure()
+        run: |
+          kubectl get statefulset,pods,service,pvc \
+            --namespace database \
+            --output=wide || true
+
+          kubectl get deployment,pods \
+            --namespace vulnerable-app \
+            --output=wide || true
+
+          kubectl get events \
+            --namespace database \
+            --sort-by='.lastTimestamp' || true
+
+          kubectl logs statefulset/postgres \
+            --namespace database \
+            --tail=100 || true
