@@ -112,7 +112,8 @@ INDEX_TEMPLATE = """
         <h3>Recent Comments:</h3>
         {% for comment in comments %}
         <div class="post">
-            <strong>{{ comment.author }}:</strong> {{ comment.content|safe }}
+            <strong>{{ comment[0] }}:</strong> {{ comment[1]|safe }}
+
         </div>
         {% endfor %}
         {% endif %}
