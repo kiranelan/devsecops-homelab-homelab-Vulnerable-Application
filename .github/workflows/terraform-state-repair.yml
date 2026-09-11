@@ -1,0 +1,78 @@
+name: Repair Terraform State
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type UNTAINT to repair the WAF log-group state"
+        required: true
+        type: string
+
+concurrency:
+  group: terraform-state-maintenance
+  cancel-in-progress: false
+
+jobs:
+  untaint-waf-log-group:
+    name: Untaint WAF CloudWatch log group
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    if: >
+      github.ref == 'refs/heads/main' &&
+      inputs.confirmation == 'UNTAINT'
+
+    environment: lab
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::854481201284:role/DevSecOpsLabTerraformRole
+          aws-region: us-west-2
+          role-session-name: devsecops-terraform-state-repair
+
+      - name: Verify assumed AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Initialize Terraform backend
+        run: |
+          terraform -chdir=terraform init \
+            -input=false \
+            -reconfigure
+
+      - name: Show current WAF log-group state
+        run: |
+          terraform -chdir=terraform state show \
+            'aws_cloudwatch_log_group.waf[0]'
+
+      - name: Remove WAF log-group taint
+        run: |
+          terraform -chdir=terraform untaint \
+            'aws_cloudwatch_log_group.waf[0]'
+
+      - name: Confirm repaired state
+        run: |
+          terraform -chdir=terraform state show \
+            'aws_cloudwatch_log_group.waf[0]'
+
+          {
+            echo "## Terraform state repair"
+            echo
+            echo "The WAF CloudWatch log group was successfully untainted."
+            echo
+            echo "No AWS resources were deleted or recreated."
+          } >> "$GITHUB_STEP_SUMMARY"
