@@ -14,18 +14,28 @@ concurrency:
 
 jobs:
   deploy-database:
-    name: Deploy PostgreSQL to EKS
+    name: Deploy PostgreSQL to EKS with Helm
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
 
     if: >
-      github.ref == 'refs/heads/main' && inputs.confirmation == 'DEPLOY'
+      github.ref == 'refs/heads/main' &&
+      inputs.confirmation == 'DEPLOY'
 
     environment: lab
 
     permissions:
       id-token: write
       contents: read
+
+    env:
+      AWS_REGION: us-west-2
+      EKS_CLUSTER_NAME: eks-interview-lab
+      HELM_RELEASE: postgres
+      POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+      POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+      POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
 
     steps:
       - name: Checkout repository
@@ -35,7 +45,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: arn:aws:iam::854481201284:role/DevSecOpsLabTerraformRole
-          aws-region: us-west-2
+          aws-region: ${{ env.AWS_REGION }}
           role-session-name: devsecops-database-deploy
 
       - name: Set up kubectl
@@ -43,20 +53,26 @@ jobs:
         with:
           version: latest
 
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: latest
+
       - name: Configure EKS access
         run: |
           aws eks update-kubeconfig \
-            --region us-west-2 \
-            --name eks-interview-lab
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
 
-          kubectl auth can-i create deployments \
+          kubectl get nodes
+          kubectl auth can-i create statefulsets \
             --namespace database
+          kubectl auth can-i create persistentvolumeclaims \
+            --namespace database
+          kubectl auth can-i create storageclasses
 
       - name: Validate required GitHub secrets
-        env:
-          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
-          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        shell: bash
         run: |
           test -n "$POSTGRES_DB" || {
             echo "POSTGRES_DB is not configured."
@@ -73,80 +89,357 @@ jobs:
             exit 1
           }
 
-      - name: Render and validate database manifests
-        run: |
-          kubectl kustomize database > database-rendered.yaml
-          kubectl apply \
-            --dry-run=client \
-            --filename database-rendered.yaml
+          test -n "$POSTGRES_ADMIN_PASSWORD" || {
+            echo "POSTGRES_ADMIN_PASSWORD is not configured."
+            exit 1
+          }
 
-      - name: Create database namespace and credentials
-        env:
-          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
-          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          if [ "${#POSTGRES_PASSWORD}" -lt 24 ]; then
+            echo "POSTGRES_PASSWORD must contain at least 24 characters."
+            exit 1
+          fi
+
+          if [ "${#POSTGRES_ADMIN_PASSWORD}" -lt 24 ]; then
+            echo "POSTGRES_ADMIN_PASSWORD must contain at least 24 characters."
+            exit 1
+          fi
+
+          echo "::add-mask::$POSTGRES_PASSWORD"
+          echo "::add-mask::$POSTGRES_ADMIN_PASSWORD"
+
+      - name: Verify EBS CSI driver
+        run: |
+          ADDON_STATUS="$(
+            aws eks describe-addon \
+              --region "$AWS_REGION" \
+              --cluster-name "$EKS_CLUSTER_NAME" \
+              --addon-name aws-ebs-csi-driver \
+              --query 'addon.status' \
+              --output text
+          )"
+
+          if [ "$ADDON_STATUS" != "ACTIVE" ]; then
+            echo "EBS CSI add-on is not ACTIVE: $ADDON_STATUS"
+            exit 1
+          fi
+
+          kubectl get csidriver ebs.csi.aws.com
+
+      - name: Create database namespace
         run: |
           kubectl apply --filename database/namespace.yaml
 
-          kubectl create secret generic postgres-credentials \
-            --namespace database \
-            --from-literal=POSTGRES_DB="$POSTGRES_DB" \
-            --from-literal=POSTGRES_USER="$POSTGRES_USER" \
-            --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
-            --dry-run=client \
-            --output=yaml \
-            | kubectl apply --filename -
-
-      - name: Deploy PostgreSQL
+      - name: Add Bitnami Helm repository
         run: |
-          kubectl apply --kustomize database
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm repo update
 
+          helm search repo bitnami/postgresql \
+            --versions |
+          head -n 5
+
+      - name: Detect existing database installation
+        id: database-state
+        shell: bash
+        run: |
+          if helm status "$HELM_RELEASE" \
+            --namespace database >/dev/null 2>&1; then
+            echo "installation=helm" >> "$GITHUB_OUTPUT"
+            echo "Existing Helm release detected."
+          elif kubectl get deployment postgres \
+            --namespace database >/dev/null 2>&1; then
+            echo "installation=legacy" >> "$GITHUB_OUTPUT"
+            echo "Existing manifest-based deployment detected."
+          else
+            echo "installation=none" >> "$GITHUB_OUTPUT"
+            echo "No existing PostgreSQL installation detected."
+          fi
+
+      - name: Back up legacy PostgreSQL database
+        if: steps.database-state.outputs.installation == 'legacy'
+        shell: bash
+        run: |
           kubectl rollout status deployment/postgres \
             --namespace database \
             --timeout=5m
 
-      - name: Verify database resources
-        run: |
-          kubectl get deployment,pods,service \
+          kubectl exec \
             --namespace database \
-            --output=wide
+            deployment/postgres \
+            -- \
+            pg_dump \
+              --username="$POSTGRES_USER" \
+              --dbname="$POSTGRES_DB" \
+              --format=custom \
+              --no-owner \
+              --no-privileges \
+            > postgres-migration-backup.dump
 
-      - name: Verify initialized database
-        env:
-          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
-          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          test -s postgres-migration-backup.dump
+
+          pg_restore --list postgres-migration-backup.dump \
+            > postgres-migration-backup.list
+
+          test -s postgres-migration-backup.list
+
+          sha256sum postgres-migration-backup.dump \
+            > postgres-migration-backup.sha256
+
+      - name: Encrypt migration backup for emergency recovery
+        if: steps.database-state.outputs.installation == 'legacy'
+        shell: bash
+        run: |
+          openssl enc \
+            -aes-256-cbc \
+            -salt \
+            -pbkdf2 \
+            -in postgres-migration-backup.dump \
+            -out postgres-migration-backup.dump.enc \
+            -pass env:POSTGRES_ADMIN_PASSWORD
+
+          test -s postgres-migration-backup.dump.enc
+
+      - name: Record existing database counts
+        if: steps.database-state.outputs.installation == 'legacy'
         run: |
           kubectl exec \
             --namespace database \
             deployment/postgres \
-            -- psql \
-            --username="$POSTGRES_USER" \
-            --dbname="$POSTGRES_DB" \
-            --command="SELECT COUNT(*) AS users FROM users; SELECT COUNT(*) AS posts FROM posts;"
+            -- \
+            psql \
+              --username="$POSTGRES_USER" \
+              --dbname="$POSTGRES_DB" \
+              --command="
+                SELECT 'users' AS table_name, COUNT(*) AS row_count
+                FROM users
+                UNION ALL
+                SELECT 'posts', COUNT(*) FROM posts
+                UNION ALL
+                SELECT 'comments', COUNT(*) FROM comments;
+              " |
+          tee database-counts-before.txt
+
+      - name: Apply encrypted gp3 StorageClass
+        run: |
+          kubectl apply \
+            --filename database/storageclass.yaml
+
+          kubectl get storageclass gp3-encrypted \
+            --output=wide
+
+      - name: Create Helm-compatible PostgreSQL Secret
+        shell: bash
+        run: |
+          kubectl create secret generic postgres-credentials \
+            --namespace database \
+            --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+            --from-literal=POSTGRES_ADMIN_PASSWORD="$POSTGRES_ADMIN_PASSWORD" \
+            --dry-run=client \
+            --output=yaml |
+          kubectl apply --filename -
+
+      - name: Scale Flask down for database migration
+        if: steps.database-state.outputs.installation == 'legacy'
+        run: |
+          kubectl scale deployment/vulnerable-app \
+            --namespace vulnerable-app \
+            --replicas=0
+
+          kubectl rollout status deployment/vulnerable-app \
+            --namespace vulnerable-app \
+            --timeout=5m
+
+      - name: Remove legacy PostgreSQL resources
+        if: steps.database-state.outputs.installation == 'legacy'
+        run: |
+          kubectl delete deployment postgres \
+            --namespace database \
+            --wait=true \
+            --timeout=5m
+
+          kubectl delete service postgres \
+            --namespace database \
+            --ignore-not-found=true
+
+      - name: Install PostgreSQL with Helm
+        run: |
+          helm upgrade --install "$HELM_RELEASE" \
+            bitnami/postgresql \
+            --namespace database \
+            --values database/postgres-values.yaml \
+            --wait \
+            --wait-for-jobs \
+            --timeout 15m \
+            --atomic
+
+      - name: Verify Helm release and persistent storage
+        run: |
+          helm status "$HELM_RELEASE" \
+            --namespace database
+
+          kubectl rollout status statefulset/postgres \
+            --namespace database \
+            --timeout=10m
+
+          kubectl get statefulset,pods,service,persistentvolumeclaim \
+            --namespace database \
+            --output=wide
+
+          PVC_NAME="$(
+            kubectl get persistentvolumeclaim \
+              --namespace database \
+              --output jsonpath='{.items[0].metadata.name}'
+          )"
+
+          test -n "$PVC_NAME"
+
+          PVC_STATUS="$(
+            kubectl get persistentvolumeclaim "$PVC_NAME" \
+              --namespace database \
+              --output jsonpath='{.status.phase}'
+          )"
+
+          PVC_SIZE="$(
+            kubectl get persistentvolumeclaim "$PVC_NAME" \
+              --namespace database \
+              --output jsonpath='{.spec.resources.requests.storage}'
+          )"
+
+          STORAGE_CLASS="$(
+            kubectl get persistentvolumeclaim "$PVC_NAME" \
+              --namespace database \
+              --output jsonpath='{.spec.storageClassName}'
+          )"
+
+          echo "PVC: $PVC_NAME"
+          echo "Status: $PVC_STATUS"
+          echo "Requested size: $PVC_SIZE"
+          echo "StorageClass: $STORAGE_CLASS"
+
+          test "$PVC_STATUS" = "Bound"
+          test "$PVC_SIZE" = "10Gi"
+          test "$STORAGE_CLASS" = "gp3-encrypted"
+
+      - name: Restore database backup
+        if: steps.database-state.outputs.installation == 'legacy'
+        shell: bash
+        run: |
+          kubectl exec \
+            --stdin \
+            --namespace database \
+            statefulset/postgres \
+            -- \
+            pg_restore \
+              --username="$POSTGRES_USER" \
+              --dbname="$POSTGRES_DB" \
+              --clean \
+              --if-exists \
+              --no-owner \
+              --no-privileges \
+            < postgres-migration-backup.dump
+
+      - name: Verify initialized database
+        run: |
+          kubectl exec \
+            --namespace database \
+            statefulset/postgres \
+            -- \
+            psql \
+              --username="$POSTGRES_USER" \
+              --dbname="$POSTGRES_DB" \
+              --command="
+                SELECT 'users' AS table_name, COUNT(*) AS row_count
+                FROM users
+                UNION ALL
+                SELECT 'posts', COUNT(*) FROM posts
+                UNION ALL
+                SELECT 'comments', COUNT(*) FROM comments;
+              " |
+          tee database-counts-after.txt
+
+      - name: Scale Flask application up
+        if: steps.database-state.outputs.installation == 'legacy'
+        run: |
+          kubectl scale deployment/vulnerable-app \
+            --namespace vulnerable-app \
+            --replicas=1
+
+          kubectl rollout status deployment/vulnerable-app \
+            --namespace vulnerable-app \
+            --timeout=5m
+
+      - name: Verify application readiness
+        if: steps.database-state.outputs.installation == 'legacy'
+        shell: bash
+        run: |
+          APP_POD="$(
+            kubectl get pods \
+              --namespace vulnerable-app \
+              --selector=app.kubernetes.io/name=vulnerable-app \
+              --field-selector=status.phase=Running \
+              --sort-by=.metadata.creationTimestamp \
+              --output=jsonpath='{.items[-1:].metadata.name}'
+          )"
+
+          test -n "$APP_POD"
+
+          kubectl exec \
+            --namespace vulnerable-app \
+            "$APP_POD" \
+            -- \
+            python -c \
+              'import urllib.request; response = urllib.request.urlopen("http://127.0.0.1:5000/readyz"); assert response.status == 200; print(response.read().decode())'
 
       - name: Show diagnostic information
         if: failure()
         run: |
-          kubectl get all --namespace database || true
-          kubectl describe deployment/postgres \
+          helm status "$HELM_RELEASE" \
             --namespace database || true
+
+          kubectl get statefulset,pods,service,persistentvolumeclaim \
+            --namespace database \
+            --output=wide || true
+
+          kubectl describe pods \
+            --namespace database || true
+
+          kubectl describe persistentvolumeclaims \
+            --namespace database || true
+
           kubectl get events \
             --namespace database \
             --sort-by='.lastTimestamp' || true
-          kubectl logs deployment/postgres \
+
+          kubectl logs statefulset/postgres \
             --namespace database \
             --tail=100 || true
+
+      - name: Upload encrypted migration evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: postgres-helm-migration-evidence
+          path: |
+            postgres-migration-backup.dump.enc
+            postgres-migration-backup.sha256
+            postgres-migration-backup.list
+            database-counts-before.txt
+            database-counts-after.txt
+          if-no-files-found: warn
+          retention-days: 1
 
       - name: Add deployment summary
         if: success()
         run: |
           {
-            echo "## PostgreSQL deployment"
+            echo "## PostgreSQL Helm deployment"
             echo
             echo "- Cluster: \`eks-interview-lab\`"
             echo "- Namespace: \`database\`"
-            echo "- Deployment: \`postgres\`"
+            echo "- Helm release: \`postgres\`"
             echo "- Service: \`postgres.database.svc.cluster.local:5432\`"
+            echo "- StorageClass: \`gp3-encrypted\`"
+            echo "- Persistent volume request: \`10Gi\`"
             echo "- Credentials source: GitHub environment secrets"
-            echo "- Storage: temporary \`emptyDir\`"
+            echo "- Existing database data: preserved and verified"
           } >> "$GITHUB_STEP_SUMMARY"
