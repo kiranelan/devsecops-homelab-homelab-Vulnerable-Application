@@ -1,0 +1,140 @@
+name: Deploy Flask Application
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type DEPLOY to confirm the application deployment"
+        required: true
+        type: string
+
+concurrency:
+  group: application-deploy-lab
+  cancel-in-progress: false
+
+jobs:
+  deploy-application:
+    name: Deploy Flask application to EKS
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    if: >
+      github.ref == 'refs/heads/main' && inputs.confirmation == 'DEPLOY'
+
+    environment: lab
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::854481201284:role/DevSecOpsLabTerraformRole
+          aws-region: us-west-2
+          role-session-name: devsecops-application-deploy
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: latest
+
+      - name: Configure EKS access
+        run: |
+          aws eks update-kubeconfig \
+            --region us-west-2 \
+            --name eks-interview-lab
+          kubectl get nodes
+
+      - name: Validate required GitHub secrets
+        env:
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        run: |
+          test -n "$POSTGRES_DB" || { echo "POSTGRES_DB is not configured"; exit 1; }
+          test -n "$POSTGRES_USER" || { echo "POSTGRES_USER is not configured"; exit 1; }
+          test -n "$POSTGRES_PASSWORD" || { echo "POSTGRES_PASSWORD is not configured"; exit 1; }
+
+      - name: Verify PostgreSQL is available
+        run: |
+          kubectl rollout status deployment/postgres \
+            --namespace database \
+            --timeout=2m
+
+      - name: Render and validate application manifests
+        run: |
+          kubectl kustomize kubernetes/base > application-rendered.yaml
+          kubectl apply --dry-run=client --filename application-rendered.yaml
+
+      - name: Create application namespace and database credentials
+        env:
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        run: |
+          kubectl apply --filename kubernetes/base/namespace.yaml
+
+          kubectl create secret generic vulnerable-app-secrets \
+            --namespace vulnerable-app \
+            --from-literal=DB_NAME="$POSTGRES_DB" \
+            --from-literal=DB_USER="$POSTGRES_USER" \
+            --from-literal=DB_PASSWORD="$POSTGRES_PASSWORD" \
+            --dry-run=client \
+            --output=yaml | kubectl apply --filename -
+
+      - name: Deploy application internally
+        run: |
+          kubectl apply --kustomize kubernetes/base
+          kubectl rollout status deployment/vulnerable-app \
+            --namespace vulnerable-app \
+            --timeout=10m
+
+      - name: Verify internal application endpoints
+        run: |
+          kubectl port-forward \
+            --namespace vulnerable-app \
+            service/vulnerable-app 8080:80 \
+            > /tmp/vulnerable-app-port-forward.log 2>&1 &
+          PORT_FORWARD_PID=$!
+          trap 'kill "$PORT_FORWARD_PID" 2>/dev/null || true' EXIT
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8080/healthz > /dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              cat /tmp/vulnerable-app-port-forward.log
+              exit 1
+            fi
+            sleep 2
+          done
+
+          curl --fail --show-error http://127.0.0.1:8080/healthz
+          curl --fail --show-error http://127.0.0.1:8080/readyz
+
+      - name: Show diagnostic information
+        if: failure()
+        run: |
+          kubectl get all --namespace vulnerable-app || true
+          kubectl describe deployment/vulnerable-app --namespace vulnerable-app || true
+          kubectl get events --namespace vulnerable-app --sort-by='.lastTimestamp' || true
+          kubectl logs deployment/vulnerable-app --namespace vulnerable-app --tail=100 || true
+
+      - name: Add deployment summary
+        if: success()
+        run: |
+          {
+            echo "## Internal Flask deployment"
+            echo
+            echo "- Cluster: \`eks-interview-lab\`"
+            echo "- Namespace: \`vulnerable-app\`"
+            echo "- Service: \`vulnerable-app.vulnerable-app.svc.cluster.local:80\`"
+            echo "- Exposure: internal ClusterIP only"
+            echo "- Image: immutable ECR digest"
+            echo "- Health and database readiness checks: passed"
+          } >> "$GITHUB_STEP_SUMMARY"

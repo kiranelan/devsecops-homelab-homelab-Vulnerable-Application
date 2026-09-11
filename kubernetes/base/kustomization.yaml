@@ -6,9 +6,8 @@ resources:
   - service-account.yaml
   - deployment.yaml
   - service.yaml
-  - security-controls.yaml
   - network-policies.yaml
 images:
   - name: vulnerable-flask
-    newName: REPLACE_WITH_ECR_REPOSITORY
-    newTag: latest
+    newName: 854481201284.dkr.ecr.us-west-2.amazonaws.com/eks-interview-lab/vulnerable-app
+    digest: sha256:55d7a4241c3aadc90a74089953c498b33b401195dc5bb94ef66ad7acb2227adc
