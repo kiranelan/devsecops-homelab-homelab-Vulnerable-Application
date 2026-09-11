@@ -11,6 +11,7 @@ metadata:
     alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
     alb.ingress.kubernetes.io/healthcheck-port: traffic-port
     alb.ingress.kubernetes.io/success-codes: "200"
+    alb.ingress.kubernetes.io/wafv2-acl-arn: arn:aws:wafv2:us-west-2:854481201284:regional/webacl/eks-interview-lab-waf/10cc056b-6a4c-4c40-9438-d6deb2dd439c
     alb.ingress.kubernetes.io/tags: Environment=lab,ManagedBy=kubernetes,Purpose=devsecops-interview
 spec:
   ingressClassName: alb
