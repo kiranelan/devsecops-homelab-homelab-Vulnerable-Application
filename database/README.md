@@ -6,6 +6,13 @@ This directory contains PostgreSQL database configuration and test data.
 
 - **`init-db.sql`** - Database initialization script with test data
 - **`postgres-values.yaml`** - Helm values for PostgreSQL deployment
+- **`storageclass.yaml`** - Encrypted gp3 StorageClass used by the database PVC
+- **`namespace.yaml`** - Database namespace definition
+
+The supported deployment path is `.github/workflows/database-deploy.yml`. The
+workflow creates the runtime Secret from protected GitHub environment secrets,
+deploys the Helm release, initializes the schema idempotently, and verifies the
+10 Gi persistent volume and application readiness.
 
 ## Test Data Included
 
@@ -22,21 +29,22 @@ This directory contains PostgreSQL database configuration and test data.
    kubectl -n database create secret generic postgres-credentials \
      --from-literal=postgres-password='<generated-admin-password>' \
      --from-literal=password='<generated-app-password>'
-   helm upgrade --install postgresql \
+   kubectl apply -f storageclass.yaml
+   helm upgrade --install postgres \
      oci://registry-1.docker.io/bitnamicharts/postgresql \
      -n database -f postgres-values.yaml
    ```
 
 2. Import test data:
    ```bash
-   kubectl -n database cp init-db.sql postgresql-0:/tmp/init-db.sql
-   kubectl -n database exec -it postgresql-0 -- \
+   kubectl -n database cp init-db.sql postgres-0:/tmp/init-db.sql
+   kubectl -n database exec -it postgres-0 -- \
      psql -U appuser -d vulnerable_app -f /tmp/init-db.sql
    ```
 
 3. Verify data import:
    ```bash
-   kubectl -n database exec -it postgresql-0 -- \
+   kubectl -n database exec -it postgres-0 -- \
      psql -U appuser -d vulnerable_app -c "SELECT COUNT(*) FROM users;"
    ```
 
