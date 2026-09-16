@@ -77,9 +77,21 @@ jobs:
 
       - name: Capture Terraform resource identifiers
         id: terraform-resources
+        shell: bash
         run: |
-          VPC_ID="$(terraform -chdir=terraform output -raw vpc_id 2>/dev/null || true)"
-          echo "vpc_id=${VPC_ID}" >> "$GITHUB_OUTPUT"
+          VPC_ID="$(
+            terraform -chdir=terraform output -json 2>/dev/null |
+            jq -r 'if has("vpc_id") then .vpc_id.value else empty end' \
+              2>/dev/null || true
+          )"
+
+          printf 'vpc_id=%s\n' "$VPC_ID" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$VPC_ID" ]; then
+            echo "Captured VPC ID: $VPC_ID"
+          else
+            echo "VPC output is absent; it may already have been destroyed."
+          fi
 
       - name: Connect kubectl to EKS
         id: eks
